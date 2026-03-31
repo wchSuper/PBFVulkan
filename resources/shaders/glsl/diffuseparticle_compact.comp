@@ -1,0 +1,46 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#extension GL_EXT_shader_atomic_float : enable
+#include "simulationcommon.h"
+
+layout(binding=19) buffer DiffuseParticleBuffer {
+    DiffuseParticle diffuseParticles[];
+};
+
+layout(binding=20) buffer DiffuseParticleCountBuffer {
+    DiffuseParticleCount dpc;
+};
+
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+
+// ========== 移除死亡粒子 ==========
+// 
+// 工作原理：
+// 1. 遍历 [0, activeCount) 的所有粒子
+// 2. 只保留 LifeTime > 0 的活跃粒子
+// 3. 使用原子计数器将活跃粒子紧凑写回数组前面
+//
+// 示例：
+// 更新前: [活, 死, 活, 死, 活, 死, 活, 死]  activeCount=8
+// 紧凑后: [活, 活, 活, 活, ?, ?, ?, ?]     compactCount=4 下一帧activeCount <- compactCount
+
+void main() {
+    uint globalindex = gl_GlobalInvocationID.x;
+    
+    // 只处理当前活跃范围
+    if (globalindex >= dpc.activeCount) return;
+    
+    DiffuseParticle particle = diffuseParticles[globalindex];
+    
+    if (particle.LifeTime > 0.0) {
+        uint writePos = atomicAdd(dpc.compactCount, 1);
+        
+        // 紧凑写入
+        diffuseParticles[writePos].Location = particle.Location;
+        diffuseParticles[writePos].Velocity = particle.Velocity;
+        diffuseParticles[writePos].Mass = particle.Mass;
+        diffuseParticles[writePos].DiffuseBuoyancy = particle.DiffuseBuoyancy;
+        diffuseParticles[writePos].LifeTime = particle.LifeTime;
+        diffuseParticles[writePos].Type = particle.Type;
+    }
+}

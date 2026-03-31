@@ -1,0 +1,49 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#include "mpm2common.h"
+#include "mg_common.h"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 4) buffer PressureA { float pA[]; };
+layout(std430, set = 0, binding = 5) buffer PressureB { float pB[]; };
+
+float readP(uint idx) {
+    return (mg.src == 0) ? pA[idx] : pB[idx];
+}
+
+void addP(uint idx, float v) {
+    if (mg.src == 0) {
+        pA[idx] += v;
+    } else {
+        pB[idx] += v;
+    }
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    int nF = mg.n;
+    uint count = uint(nF * nF * nF);
+    if (tid >= count) return;
+
+    int xF = int(tid) / (nF * nF);
+    int yF = (int(tid) / nF) % nF;
+    int zF = int(tid) % nF;
+
+    if (xF <= 0 || yF <= 0 || zF <= 0 || xF >= nF - 1 || yF >= nF - 1 || zF >= nF - 1) {
+        return;
+    }
+
+    int nC = nF / 2;
+    int xC = clamp(xF / 2, 0, nC - 1);
+    int yC = clamp(yF / 2, 0, nC - 1);
+    int zC = clamp(zF / 2, 0, nC - 1);
+
+    uint fineBase = uint(mg.levelOffset);
+    uint coarseBase = uint(mg.coarseOffset);
+
+    uint fineIdx = fineBase + tid;
+    uint coarseIdx = coarseBase + uint(xC * nC * nC + yC * nC + zC);
+
+    addP(fineIdx, readP(coarseIdx));
+}

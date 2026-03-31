@@ -1,0 +1,1108 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#extension GL_NV_compute_shader_derivatives : enable
+#include "renderingcommon.h"
+
+float PI = 3.1415926;
+
+layout(local_size_x=4, local_size_y=4, local_size_z=1) in;
+
+ivec2 imagesize;
+
+layout(binding=1) uniform sampler2D depthimage;       // 流体粒子深度
+layout(binding=2) uniform sampler2D thicknessimage;   // 流体粒子厚度
+layout(binding=3) uniform sampler2D backgroundimage;  // 背景图像
+layout(binding=4) uniform sampler2D thicknessimage2;  // 刚体粒子厚度
+layout(binding=5) uniform sampler2D depthimage2;      // 刚体粒子深度
+layout(binding=6, rgba8) uniform writeonly image2D dstimage;
+layout(binding=7) uniform sampler2D backdepthimage;   // 背景深度�?
+layout(binding=8) uniform samplerCube skyboxCubemap;  // Cubemap 天空盒用于反�?
+layout(binding=9) uniform sampler2D causticsimage;
+
+float Fresnel(float cos_v, float R0) {
+    return R0 + (1.0 - R0) * pow(1.0 - cos_v, 5.0);
+}
+
+float computeFresnel(float cosTheta, float ior) {
+    float r0 = (1.0 - ior) / (1.0 + ior);
+    r0 = r0 * r0;
+    return r0 + (1.0 - r0) * pow(1.0 - cosTheta, 5.0);
+}
+
+float noise(vec2 st) {
+    return fract(sin(dot(st.xy, vec2(12.9898, 78.233))) * 43758.5453123);
+}
+
+vec3 viewLocationRecon(vec2 coord, sampler2D depthTex) {
+    float u = coord.x / imagesize.x;
+    float v = coord.y / imagesize.y;
+    float d = (u < 0 || v < 0 || u > 1 || v > 1) ? 1000.0 : texture(depthTex, vec2(u, v)).r;
+    vec4 ndcLocation = vec4(u * 2.0 - 1.0, v * 2.0 - 1.0, d, 1.0);
+    float clipw = 1.0 / ((inv_projection * ndcLocation).w);
+    vec4 viewLocation = clipw * inv_projection * ndcLocation;
+    return viewLocation.xyz;
+}
+
+vec3 computeNormal(vec2 uv, sampler2D depthTex) {
+    vec2 centerCoord = uv * vec2(imagesize);
+    vec2 topCoord = centerCoord + vec2(0, -1);
+    vec2 bottomCoord = centerCoord + vec2(0, 1);
+    vec2 leftCoord = centerCoord + vec2(-1, 0);
+    vec2 rightCoord = centerCoord + vec2(1, 0);
+
+    vec3 centerPos = viewLocationRecon(centerCoord, depthTex);
+    vec3 leftDx = centerPos - viewLocationRecon(leftCoord, depthTex);
+    vec3 rightDx = viewLocationRecon(rightCoord, depthTex) - centerPos;
+    vec3 topDy = viewLocationRecon(topCoord, depthTex) - centerPos;
+    vec3 bottomDy = centerPos - viewLocationRecon(bottomCoord, depthTex);
+
+    vec3 dx = (abs(leftDx.z) > abs(rightDx.z)) ? rightDx : leftDx;
+    vec3 dy = (abs(topDy.z) > abs(bottomDy.z)) ? bottomDy : topDy;
+    return normalize(cross(dx, dy));
+}
+
+// ==================== 屏幕空间软阴影 (SSSS) ====================
+// 简化版：基于厚度和法线的自阴影估计
+// 对于流体，使用厚度来估计自遮挡
+
+// 基于厚度的自阴影 - 更适合流体，性能友好
+float computeThicknessShadow(float thickness, float NdotL) {
+    // 厚度越大，自阴影越强
+    float thicknessShadow = exp(-thickness * 0.5);
+    
+    // NdotL调整 - 背光面更�?
+    float lightFacing = smoothstep(-0.2, 0.6, NdotL);
+    
+    // 组合 - 阴影范围 0.2 ~ 1.0
+    float shadow = mix(0.2, 1.0, thicknessShadow * lightFacing);
+    return shadow;
+}
+
+// 简化的屏幕空间阴影 - 只基于厚度和法线，无ray marching
+// 这个版本性能更好，效果也足够
+float computeScreenSpaceShadow(vec3 posView, vec3 normalView, vec3 lightDirView, sampler2D depthTex) {
+    float NdotL = dot(normalView, lightDirView);
+    
+    // 背光面直接返回阴�?
+    if (NdotL <= 0.0) {
+        return 0.3;
+    }
+    
+    // 基于法线和光照方向的简单阴�?
+    // 边缘区域（法线与视线夹角大）更容易产生自阴影
+    float edgeFactor = 1.0 - abs(dot(normalView, vec3(0.0, 0.0, 1.0)));
+    
+    // 阴影强度：边缘更暗，正对光源更亮
+    float shadow = mix(0.4, 1.0, NdotL * (1.0 - edgeFactor * 0.5));
+    
+    return shadow;
+}
+
+// ==================== Cubemap 反射 ====================
+
+// 使用 Cubemap 计算反射颜色
+vec3 sampleCubemapReflection(vec3 viewDir, vec3 normal) {
+    // 计算反射方向 (视空�?
+    vec3 reflectDirView = reflect(-viewDir, normal);
+    
+    // 将反射方向从视空间转换到世界空间
+    // inv_view 的转置的�?= inv_view 的转�?(对于正交矩阵)
+    // 对于方向向量，使�?mat3(inv_view)
+    vec3 reflectDirWorld = normalize(mat3(inv_view) * reflectDirView);
+    
+    // 采样 Cubemap
+    return texture(skyboxCubemap, reflectDirWorld).rgb;
+}
+
+// �?LOD �?Cubemap 采样 (用于模糊反射)
+vec3 sampleCubemapReflectionLOD(vec3 viewDir, vec3 normal, float roughness) {
+    vec3 reflectDirView = reflect(-viewDir, normal);
+    vec3 reflectDirWorld = normalize(mat3(inv_view) * reflectDirView);
+    
+    // roughness 越大，采样越模糊�?mipmap 级别
+    float lod = roughness * 6.0; // 假设 cubemap �?6 �?mipmap
+    return textureLod(skyboxCubemap, reflectDirWorld, lod).rgb;
+}
+
+// 流体粒子渲染
+vec3 computeFluidColor(float depth, float thickness, vec2 uv, vec3 baseColor, sampler2D depthTex) {
+    if (depth >= 100.0) return vec3(0.0);
+
+    vec3 normal = computeNormal(uv, depthTex);
+    vec3 viewPosView = viewLocationRecon(uv * vec2(imagesize), depthTex);
+    vec3 viewDir = -normalize(viewPosView);
+    
+    // 只在需要时计算世界空间位置（点光源需要）
+    vec3 viewPosWorld = (inv_view * vec4(viewPosView, 1.0)).xyz;
+    
+    float Kd = 0.6;
+    float Ks = 0.6;
+    vec3 frag_color = vec3(0.0);
+
+    // 使用UBO中的环境�?
+    vec3 ambient = baseColor * ambientColor;
+    frag_color += ambient;
+
+    // 只处理启用的光源，避免无效计�?
+    for (int i = 0; i < 3; ++i) {
+        if (lights[i].enabled == 0u) continue;  // 跳过禁用的光�?
+        
+        // 计算光照方向
+        vec3 lightDirWorld;
+        if (lights[i].type == 0u) {
+            lightDirWorld = normalize(lights[i].position - viewPosWorld);
+        } else {
+            lightDirWorld = normalize(-lights[i].position);
+        }
+        vec3 lightIntensity = lights[i].color * lights[i].intensity;
+        
+        vec3 lightDir = normalize((view * vec4(lightDirWorld, 0)).xyz);
+        vec3 halfVec = normalize(viewDir + lightDir);
+        
+        // 计算漫反�?
+        float diffuseFactor = max(dot(lightDir, normal), 0.0);
+        vec3 diffuse = Kd * baseColor * lightIntensity * diffuseFactor * 0.5;
+        
+        // 增强反射效果，特别是在厚区域的边�?
+        float specularPower = i == 2 ? 200.0 : 400.0; // 轮廓光源使用较软的高�?
+        vec3 specular = lightIntensity * vec3(Ks * pow(max(dot(halfVec, normal), 0.0), specularPower));
+        
+        frag_color += diffuse + specular;
+    }
+
+    float thicknessScale = 2.2;
+    float adjustedThickness = max(thickness * thicknessScale, 0.3);
+    
+    // 使用更强的指数来让厚度大的区域更�?
+    vec3 transmission = exp(-(vec3(1.0) - baseColor) * adjustedThickness * 1.7);
+    
+    // 对非常厚的区域应用额外的暗化
+    float thicknessFactor = clamp(thickness, 0.0, 10.0);
+    vec3 darkeningFactor = mix(vec3(1.0), vec3(0.5), min(thicknessFactor * 0.12, 0.7));
+    transmission *= darkeningFactor;
+    
+    float refractScale = 0.03;
+    vec2 refractCoord = uv + normal.xy * refractScale;
+    vec3 refractColor = texture(backgroundimage, refractCoord).xyz * transmission;
+    frag_color += refractColor;
+
+    return frag_color;
+}
+
+// 焦散
+vec3 computeCaustics(vec2 uv, float depth, float thickness, vec3 normal) {
+    return vec3(0.0);
+    // 使用更真实的焦散生成方法
+    // 基于水面法线扰动和光线折射原�?
+    
+    // 焦散强度和颜色参�?
+    float causticsIntensity = 0.5;
+    vec3 causticsColor = vec3(1.0, 1.0, 0.9); // 略微偏黄的白�?
+    
+    // 使用多层噪声模拟水面波动
+    vec2 p = uv * 40.0; // 基础缩放
+    
+    // 扰动函数 - 模拟水面波动
+    float distortion = 0.0;
+    
+    // 第一层波�?- 大尺度波�?
+    distortion += sin(p.x * 0.5 + depth * 0.04) * sin(p.y * 0.5 + depth * 0.03) * 0.5;
+    
+    // 第二层波�?- 中尺度波�?
+    vec2 p2 = p * 2.0 + distortion * 0.5;
+    distortion += sin(p2.x * 0.3 - depth * 0.05) * sin(p2.y * 0.3 + depth * 0.06) * 0.25;
+    
+    // 第三层波�?- 小尺度波动，增加细节
+    vec2 p3 = p * 4.0 + distortion * 0.25;
+    distortion += sin(p3.x * 0.2 + depth * 0.07) * sin(p3.y * 0.2 - depth * 0.08) * 0.125;
+    
+    // 计算光线汇聚强度 - 使用梯度
+    // 梯度越大，表示光线越集中，焦散越�?
+    vec2 dx = vec2(1.0/imagesize.x, 0.0);
+    vec2 dy = vec2(0.0, 1.0/imagesize.y);
+    
+    float gradX = (sin(p.x + dx.x + distortion) - sin(p.x - dx.x + distortion));
+    float gradY = (sin(p.y + dy.y + distortion) - sin(p.y - dy.y + distortion));
+    float gradient = sqrt(gradX * gradX + gradY * gradY);
+    
+    // 应用光线汇聚效果
+    float causticsMask = pow(abs(gradient), 1.5) * 2.0;
+    
+    // 使用法线信息调整焦散方向
+    causticsMask *= (1.0 + dot(normal, vec3(0.0, 1.0, 0.0))) * 0.5;
+    
+    // 厚度和深度调�?
+    float depthFactor = 1.0 - clamp(depth * 0.05, 0.0, 0.9); // 深度越大，焦散越�?
+    float thicknessFactor = 1.0 - clamp(thickness * 0.5, 0.0, 0.8); // 厚度越大，焦散越�?
+    
+    // 焦散只在光线能到达的地方出现
+    causticsMask *= depthFactor * thicknessFactor;
+    
+    // 应用强度和颜�?
+    vec3 causticsEffect = causticsColor * causticsMask * causticsIntensity;
+    
+    return causticsEffect;
+}
+
+// 玻璃质感流体渲染
+vec3 computeFluidColor2(float depth, float thickness, vec2 uv, vec3 baseColor, sampler2D depthTex) {
+    if (depth >= 100.0) return vec3(0.0);
+
+    // 计算法线 (使用修复版本)
+    vec3 normal = computeNormal(uv, depthTex);
+    
+    // 视线方向
+    vec3 viewDir = -normalize(viewLocationRecon(uv * vec2(imagesize), depthTex));
+    
+    // 计算视距，用于适应性调�?
+    float viewDistance = length(viewLocationRecon(uv * vec2(imagesize), depthTex));
+    float distanceFactor = smoothstep(5.0, 15.0, viewDistance);
+    
+    // 玻璃质感的蓝绿色�?
+    vec3 thinGlassColor = vec3(0.7, 0.9, 1.0);   // 薄处带更明显的蓝�?
+    vec3 thickGlassColor = vec3(0.5, 0.8, 0.95);   // 厚处更深的蓝�?
+    vec3 deepGlassColor = vec3(0.3, 0.6, 0.9);    // 最深处更浓的蓝�?
+    
+    // 根据厚度混合玻璃色调
+    float thicknessFactor = clamp(thickness * 1.5, 0.0, 1.0);
+    vec3 glassColor = mix(thinGlassColor, thickGlassColor, thicknessFactor);
+    
+    // 主光�?- 从上方照射的明亮光源
+    vec3 lightDir = normalize(vec3(0.2, 1.0, 0.5));
+    lightDir = normalize((view * vec4(lightDir, 0.0)).xyz);
+    
+    // 辅助光源 - 增强侧面照明和轮�?
+    vec3 fillLightDir = normalize(vec3(-0.4, 0.2, 0.3));
+    fillLightDir = normalize((view * vec4(fillLightDir, 0.0)).xyz);
+    
+    // 环境光照 - 非常弱，玻璃主要靠反射和折射
+    vec3 ambientLight = vec3(0.2) * glassColor;
+    
+    // 漫反射光�?- 玻璃的漫反射很弱
+    float mainDiff = max(dot(normal, lightDir), 0.0);
+    vec3 mainDiffuse = mainDiff * vec3(1.0) * glassColor * 0.1;
+    
+    float fillDiff = max(dot(normal, fillLightDir), 0.0);
+    vec3 fillDiffuse = fillDiff * vec3(0.8) * glassColor * 0.05;
+    
+    vec3 diffuse = mainDiffuse + fillDiffuse;
+    
+    // 高光计算 - 玻璃的高光非常锐�?
+    float specPower = 512.0;
+    
+    vec3 halfVector = normalize(viewDir + lightDir);
+    float spec = pow(max(dot(normal, halfVector), 0.0), specPower);
+    vec3 specular = vec3(spec) * 0.5;
+    
+    vec3 fillHalfVector = normalize(viewDir + fillLightDir);
+    float fillSpec = pow(max(dot(normal, fillHalfVector), 0.0), specPower * 0.8);
+    vec3 fillSpecular = vec3(fillSpec) * 0.2;
+    
+    // 合并高光
+    specular += fillSpecular;
+    
+    // 菲涅尔计�?
+    float F0 = 0.08; // 玻璃基础反射�?
+    float fresnel = Fresnel(max(dot(viewDir, normal), 0.0), F0);
+    
+    // 厚度影响菲涅尔效�?- 厚处反射更强
+    fresnel = mix(fresnel, fresnel * 1.5, thicknessFactor);
+    fresnel = clamp(fresnel, 0.0, 0.95);
+    
+    // 折射 - 玻璃的折射很强，但随厚度增加而减�?
+    float baseRefractStrength = 0.03;
+    float thicknessRefractFactor = 1.0 - thicknessFactor * 0.5; // 厚度越大，折射越�?
+    float refractStrength = baseRefractStrength * thicknessRefractFactor;
+    
+    // 直接计算折射，不添加随机扭曲
+    vec2 refractCoord = uv + normal.xy * refractStrength;
+    vec3 refractColor = texture(backgroundimage, refractCoord).rgb;
+    
+    // ===== 使用 Cubemap 计算反射 =====
+    vec3 reflectColor = sampleCubemapReflection(viewDir, normal);
+    
+    // 反射颜色受玻璃色调影�?
+    reflectColor = mix(reflectColor, reflectColor * glassColor, 0.2);
+    
+    // 玻璃的吸收特�?- 蓝绿光吸收较少，红光吸收较多
+    vec3 absorptionCoeff = vec3(0.08, 0.04, 0.04); // RGB吸收�?
+    vec3 transmission = exp(-absorptionCoeff * thickness * 2.5);
+    
+    // 应用吸收到折射色
+    refractColor *= transmission;
+    
+    // 添加非常轻微的散射效�?
+    float scatterFactor = 1.0 - exp(-thickness * 0.2);
+    vec3 scatterColor = glassColor * 0.1;
+    vec3 scattering = scatterColor * scatterFactor * 0.03;
+    refractColor += scattering;
+    
+    // 最终颜色混�?- 菲涅尔决定反�?折射比例
+    vec3 finalColor = mix(refractColor, reflectColor, fresnel);
+    
+    // 添加高光
+    finalColor += specular;
+    
+    // 添加微弱的漫反射
+    finalColor += diffuse * 0.2;
+    
+    // 确保玻璃始终有微弱的蓝绿色调
+    finalColor = mix(finalColor, finalColor * glassColor, 0.08);
+    
+    return finalColor;
+}
+
+// 牛奶
+vec3 computeMilkColor(float depth, float thickness, vec2 uv, vec3 baseColor, sampler2D depthTex) {
+    if (depth >= 100.0) return vec3(0.0);
+
+    // 调整牛奶的基础颜色 - 更纯的牛白色
+    vec3 milkColor = vec3(0.98, 0.97, 0.95);
+
+    vec3 normal = computeNormal(uv, depthTex);
+    vec3 viewDir = -normalize(viewLocationRecon(uv * vec2(imagesize), depthTex));
+    
+    vec3 lightDirs[3] = { 
+        vec3(0.7, 0.5, 0.5),   // 侧上方光�?
+        vec3(-0.7, 0.5, 0.3),  // 对角线方向光�?
+        vec3(0, 0.6, -0.8)     // 背向光源
+    };
+    
+    vec3 lightIntensities[3] = {
+        vec3(0.8, 0.8, 0.8),  // 主光源强�?
+        vec3(0.5, 0.5, 0.5),  // 次光源强�?
+        vec3(0.3, 0.3, 0.3)   // 轮廓光源强度
+    };
+    
+    // 牛奶特有的渲染参�?- 增强不透明�?
+    float Kd = 0.9;             // 更强的漫反射
+    float Ks = 0.2;             // 更弱的镜面反�?
+    float thicknessScale = 5.0; // 明显增强的厚度表�?
+    float ambientStrength = 0.3; // 更强的环境光
+    
+    vec3 frag_color = vec3(0.0);
+
+    // 环境光照 - 牛奶的环境光更强
+    vec3 ambient = milkColor * ambientStrength;
+    frag_color += ambient;
+
+    for (int i = 0; i < 3; ++i) {
+        vec3 lightDir = normalize((view * vec4(lightDirs[i], 0)).xyz);
+        vec3 halfVec = normalize(viewDir + lightDir);
+        
+        // 漫反�?- 牛奶的漫反射更强
+        float diffuseFactor = max(dot(lightDir, normal), 0.0);
+        vec3 diffuse = Kd * milkColor * lightIntensities[i] * diffuseFactor * 0.6;
+        
+        // 镜面反射 - 牛奶的高光更柔和
+        float specularPower = i == 2 ? 30.0 : 60.0; // 更柔和的高光
+        vec3 specular = lightIntensities[i] * vec3(Ks * pow(max(dot(halfVec, normal), 0.0), specularPower));
+        
+        frag_color += diffuse + specular;
+    }
+
+    // 厚度计算 - 牛奶透明度随厚度变化更快
+    float adjustedThickness = max(thickness * thicknessScale, 0.5);
+    vec3 transmission = exp(-(vec3(1.0) - milkColor) * adjustedThickness * 8.0);
+    
+    // 牛奶的暗化效果更明显
+    float thicknessFactor = clamp(thickness, 0.0, 10.0);
+    vec3 darkeningFactor = mix(vec3(1.0), vec3(0.3), min(thicknessFactor * 0.2, 0.9));
+    transmission *= darkeningFactor;
+    
+    // 牛奶的折射效果几乎没�?
+    float refractScale = 0.001;
+    vec2 refractCoord = uv + normal.xy * refractScale;
+    vec3 refractColor = texture(backgroundimage, refractCoord).xyz * transmission;
+    
+    // 增强牛奶的散射效�?- 牛奶的关键视觉特�?
+    float scatterFactor = 1.0 - exp(-thickness * 3.5);
+    frag_color += refractColor * 0.1; // 大幅减弱背景透射
+    frag_color += milkColor * scatterFactor * 0.3; // 增强散射效果
+    
+    // 牛奶特有的边缘光效果 - 更柔和的边缘�?
+    float rimPower = 2.5;
+    float rim = pow(1.0 - max(dot(viewDir, normal), 0.0), rimPower);
+    frag_color += rim * vec3(0.98, 0.97, 0.95) * 0.25;
+
+    return frag_color;
+}
+
+// 橙汁
+vec3 computeOrangeJuiceColor(float depth, float thickness, vec2 uv, vec3 baseColor, sampler2D depthTex) {
+    if (depth >= 100.0) return vec3(0.0);
+
+    // 橙汁的基础颜色 - 鲜橙�?
+    vec3 juiceColor = vec3(0.95, 0.5, 0.1);
+
+    vec3 normal = computeNormal(uv, depthTex);
+    vec3 viewDir = -normalize(viewLocationRecon(uv * vec2(imagesize), depthTex));
+    
+    vec3 lightDirs[3] = { 
+        vec3(0.7, 0.5, 0.5),   // 侧上方光�?
+        vec3(-0.7, 0.5, 0.3),  // 对角线方向光�?
+        vec3(0, 0.6, -0.8)     // 背向光源
+    };
+    
+    vec3 lightIntensities[3] = {
+        vec3(0.8, 0.8, 0.8),  // 主光源强�?
+        vec3(0.5, 0.5, 0.5),  // 次光源强�?
+        vec3(0.3, 0.3, 0.3)   // 轮廓光源强度
+    };
+    
+    // 橙汁特有的渲染参�?
+    float Kd = 0.7;             // 较强的漫反射
+    float Ks = 0.4;             // 中等镜面反射（果汁有光泽�?
+    float thicknessScale = 3.5; // 适中的厚度表�?
+    float ambientStrength = 0.2; // 中等环境�?
+    
+    vec3 frag_color = vec3(0.0);
+
+    // 环境光照 - 橙汁的环境光适中
+    vec3 ambient = juiceColor * ambientStrength;
+    frag_color += ambient;
+
+    for (int i = 0; i < 3; ++i) {
+        vec3 lightDir = normalize((view * vec4(lightDirs[i], 0)).xyz);
+        vec3 halfVec = normalize(viewDir + lightDir);
+        
+        // 漫反�?- 橙汁的漫反射适中
+        float diffuseFactor = max(dot(lightDir, normal), 0.0);
+        vec3 diffuse = Kd * juiceColor * lightIntensities[i] * diffuseFactor * 0.5;
+        
+        // 镜面反射 - 橙汁的高光较锐利（液体表面光滑）
+        float specularPower = i == 2 ? 80.0 : 120.0; 
+        vec3 specular = lightIntensities[i] * vec3(Ks * pow(max(dot(halfVec, normal), 0.0), specularPower));
+        
+        frag_color += diffuse + specular;
+    }
+
+    // 厚度计算 - 橙汁透明度适中
+    float adjustedThickness = max(thickness * thicknessScale, 0.3);
+    vec3 transmission = exp(-(vec3(1.0) - juiceColor * 0.5) * adjustedThickness * 2.0);
+    
+    // 内部光吸�?- 模拟橙汁密度变化
+    float densityVariation = noise(uv * 50.0) * 0.05 + 0.95;
+    
+    // 不同颜色通道的吸收率不同 - 红色吸收少，蓝色吸收�?
+    vec3 absorptionRates = vec3(0.5, 1.2, 3.0); // RGB吸收�?
+    vec3 coloredTransmission;
+    coloredTransmission.r = exp(-absorptionRates.r * adjustedThickness * densityVariation);
+    coloredTransmission.g = exp(-absorptionRates.g * adjustedThickness * densityVariation);
+    coloredTransmission.b = exp(-absorptionRates.b * adjustedThickness * densityVariation);
+    
+    // 合并颜色和厚度效�?
+    transmission *= mix(vec3(1.0), coloredTransmission, 0.7);
+    
+    // 橙汁的折射效果中�?
+    float refractScale = 0.02;
+    vec2 refractCoord = uv + normal.xy * refractScale;
+    vec3 refractColor = texture(backgroundimage, refractCoord).xyz * transmission;
+    
+    // 橙汁的散射效�?- 有但不如牛奶强烈
+    float scatterFactor = 1.0 - exp(-thickness * 1.5);
+    frag_color += refractColor * 0.4; // 背景部分可见
+    frag_color += juiceColor * scatterFactor * 0.15; // 适度散射
+    
+    // 果汁表面光泽 - 锐利的边缘高�?
+    float rimPower = 4.0;
+    float rim = pow(1.0 - max(dot(viewDir, normal), 0.0), rimPower);
+    frag_color += rim * vec3(0.9, 0.7, 0.3) * 0.3;
+    
+    // 添加微小的颗粒感 - 模拟橙汁中的果肉
+    float pulpNoise = noise(uv * 200.0) * noise(uv * 120.0);
+    if (pulpNoise > 0.75 && thickness < 5.0) {
+        // 只在较浅的区域添加果肉颗�?
+        vec3 pulpColor = vec3(1.0, 0.7, 0.2); // 略浅的橙�?
+        frag_color = mix(frag_color, pulpColor, 0.1);
+    }
+
+    return frag_color;
+}
+
+// 蜂蜜
+vec3 computeHoneyColor(float depth, float thickness, vec2 uv, vec3 baseColor, sampler2D depthTex) {
+    if (depth >= 100.0) return vec3(0.0);
+
+    // 蜂蜜的基础颜色 - 琥珀色带金黄
+    vec3 honeyColor = vec3(0.85, 0.55, 0.15);  // 金黄琥珀�?
+    vec3 deepHoneyColor = vec3(0.65, 0.35, 0.05); // 深琥珀�?
+    vec3 lightHoneyColor = vec3(0.95, 0.75, 0.25); // 浅蜜�?
+
+    vec3 normal = computeNormal(uv, depthTex);
+    vec3 viewDir = -normalize(viewLocationRecon(uv * vec2(imagesize), depthTex));
+    
+    vec3 lightDirs[3] = { 
+        vec3(0.7, 0.5, 0.5),   // 侧上方光�?
+        vec3(-0.7, 0.5, 0.3),  // 对角线方向光�?
+        vec3(0, 0.6, -0.8)     // 背向光源
+    };
+    
+    vec3 lightIntensities[3] = {
+        vec3(0.8, 0.8, 0.8),  // 主光源强�?
+        vec3(0.5, 0.5, 0.5),  // 次光源强�?
+        vec3(0.3, 0.3, 0.3)   // 轮廓光源强度
+    };
+    
+    // 蜂蜜特有的渲染参�?
+    float Kd = 0.6;             // 较强的漫反射
+    float Ks = 0.8;             // 很强的镜面反射（蜂蜜粘稠有光泽）
+    float thicknessScale = 4.0; // 加强的厚度表�?
+    float ambientStrength = 0.2; // 适中的环境光
+    
+    vec3 frag_color = vec3(0.0);
+
+    // 环境光照
+    vec3 ambient = honeyColor * ambientStrength;
+    frag_color += ambient;
+
+    for (int i = 0; i < 3; ++i) {
+        vec3 lightDir = normalize((view * vec4(lightDirs[i], 0)).xyz);
+        vec3 halfVec = normalize(viewDir + lightDir);
+        
+        // 漫反�?- 蜂蜜内部散射�?
+        float diffuseFactor = max(dot(lightDir, normal), 0.0);
+        
+        // 厚度效果 - 蜂蜜在厚处更深沉
+        vec3 honeyDiffuseColor = mix(lightHoneyColor, deepHoneyColor, min(thickness * 0.3, 0.8));
+        vec3 diffuse = Kd * honeyDiffuseColor * lightIntensities[i] * diffuseFactor * 0.6;
+        
+        // 镜面反射 - 蜂蜜的高光锐利（液体表面光滑�?
+        float specularPower = i == 2 ? 150.0 : 300.0; 
+        vec3 specular = lightIntensities[i] * vec3(Ks * pow(max(dot(halfVec, normal), 0.0), specularPower));
+        
+        frag_color += diffuse + specular;
+    }
+
+    // 粘稠度和流动特�?- 使用静态噪声模拟蜂蜜内部纹�?
+    float flowNoise = noise(uv * 10.0) * noise(uv * 20.0);
+    flowNoise = flowNoise * 0.15; 
+
+    // 厚度计算 - 蜂蜜是半透明的但透光度低
+    float adjustedThickness = max(thickness * thicknessScale, 0.4);
+    // 不同颜色通道的吸收率不同 - 蓝色吸收很强，红色吸收弱
+    vec3 absorptionRates = vec3(1.0, 2.5, 4.0); // RGB吸收�?
+    vec3 transmission;
+    transmission.r = exp(-absorptionRates.r * adjustedThickness * (1.0 + flowNoise));
+    transmission.g = exp(-absorptionRates.g * adjustedThickness * (1.0 + flowNoise));
+    transmission.b = exp(-absorptionRates.b * adjustedThickness * (1.0 + flowNoise));
+    
+    // 蜂蜜的折射效果较�?
+    float refractScale = 0.04 + flowNoise * 0.01; 
+    vec2 refractCoord = uv + normal.xy * refractScale;
+    vec3 refractColor = texture(backgroundimage, refractCoord).xyz * transmission;
+    
+    // 内部散射效果 - 蜂蜜有柔和的散射
+    float scatterFactor = 1.0 - exp(-thickness * 2.0);
+    frag_color += refractColor * 0.3; 
+    frag_color += honeyColor * scatterFactor * 0.3; 
+    
+    // 使用类似焦糖色的内部色彩变化
+    frag_color += deepHoneyColor * flowNoise * scatterFactor;
+
+    // 蜂蜜表面边缘�?- 强烈的边缘反�?
+    float rimPower = 3.0;
+    float rim = pow(1.0 - max(dot(viewDir, normal), 0.0), rimPower);
+    frag_color += rim * lightHoneyColor * 0.4;
+    
+    // 色彩饱和度增�?- 蜂蜜颜色十分饱和
+    float luminance = dot(frag_color, vec3(0.299, 0.587, 0.114));
+    frag_color = mix(vec3(luminance), frag_color, 1.3); // 增加饱和�?
+    
+    // 添加轻微黄金闪光效果 - 模拟蜂蜜晶体�?
+    float crystalEffect = pow(noise(uv * 500.0), 8.0) * 0.2;
+    frag_color += crystalEffect * lightHoneyColor;
+
+    return frag_color;
+}
+
+// 增强金属质感的金色刚体粒子渲染函�?
+vec3 computeMetalColor(float depth, float thickness, vec2 uv, vec3 baseColor, sampler2D depthTex) {
+    if (depth >= 100.0) return vec3(0.0);
+
+    // 扩展金色调范�?- 从深铜金色到亮黄�?
+    vec3 deepGoldColor = vec3(0.72, 0.43, 0.08);   // 深铜金色
+    vec3 goldBaseColor = vec3(1.0, 0.76, 0.04);    // 标准金色
+    vec3 brightGoldColor = vec3(1.0, 0.85, 0.1);   // 亮金�?
+    vec3 highlightGoldColor = vec3(1.0, 0.97, 0.6); // 金色高光
+    
+    vec3 normal = computeNormal(uv, depthTex);
+    vec3 viewPosView = viewLocationRecon(uv * vec2(imagesize), depthTex);
+    vec3 viewDir = -normalize(viewPosView);
+    vec3 lightDirs[2] = { vec3(1, 1, 1), vec3(0, 1, 0) };
+    vec3 frag_color = vec3(0.0);
+    
+    // 添加金属微纹�?
+    float microDetail = noise(uv * 300.0) * 0.05;
+    
+    // 基础金属环境�?
+    float ambientStrength = 0.25; // 降低环境光以增加对比�?
+    vec3 ambient = ambientStrength * goldBaseColor;
+    frag_color += ambient;
+    
+    // 强烈的金属漫反射和高�?
+    for (int i = 0; i < 2; ++i) {
+        vec3 lightDir = normalize((view * vec4(lightDirs[i], 0)).xyz);
+        float diffuseFactor = max(dot(normal, lightDir), 0.0);
+        
+        // 金属色调渐变 - 从暗部到亮部的过�?
+        vec3 metalDiffuse;
+        if (diffuseFactor < 0.25) {
+            metalDiffuse = mix(deepGoldColor, goldBaseColor, diffuseFactor * 4.0);
+        } else if (diffuseFactor < 0.5) {
+            metalDiffuse = mix(goldBaseColor, brightGoldColor, (diffuseFactor - 0.25) * 4.0);
+        } else {
+            metalDiffuse = mix(brightGoldColor, highlightGoldColor, (diffuseFactor - 0.5) * 2.0);
+        }
+        
+        // 添加微纹理到漫反�?
+        metalDiffuse += microDetail * diffuseFactor * goldBaseColor;
+        
+        // 应用漫反�?
+        frag_color += metalDiffuse * 0.8 * diffuseFactor;
+        
+        // 金属高光 - 使用更锐利的高光
+        vec3 halfVec = normalize(lightDir + viewDir);
+        float specularPower = 128.0; // 更高的指数值产生更尖锐的高�?
+        float specularIntensity = pow(max(dot(halfVec, normal), 0.0), specularPower);
+        
+        // 高光颜色从金色向白色过渡，真实金属的高光通常偏白
+        vec3 specularColor = mix(brightGoldColor, vec3(1.0), specularIntensity * 0.7);
+        vec3 specular = specularIntensity * 0.8 * specularColor;
+        
+        // 应用高光
+        frag_color += specular;
+    }
+    
+    // 极强的菲涅尔效应 - 金属边缘光效
+    float fresnelBase = 0.95; // 非常高的基础反射�?
+    float fresnelExp = 8.0;   // 更强的菲涅尔衰减
+    float fresnelFactor = pow(1.0 - max(dot(normal, viewDir), 0.0), fresnelExp);
+    fresnelFactor = fresnelBase + (1.0 - fresnelBase) * fresnelFactor;
+    
+    // ===== 使用 Cubemap 计算金属反射 =====
+    vec3 reflectionColor = sampleCubemapReflectionLOD(viewDir, normal, 0.1); // 轻微模糊
+    
+    // 混合反射并染成金�?
+    vec3 goldReflection = mix(reflectionColor, brightGoldColor, 0.6);
+    
+    // 将环境反射与基础颜色混合 - 使用强烈的菲涅尔因子
+    frag_color = mix(frag_color, goldReflection, fresnelFactor * 0.8);
+    
+    // 增加边缘发光效果
+    float rimFactor = pow(1.0 - max(dot(viewDir, normal), 0.0), 5.0);
+    frag_color += rimFactor * highlightGoldColor * 0.6;
+    
+    // 对比度增�?- 使金属更具深�?
+    frag_color = pow(frag_color, vec3(0.75)); // gamma调整
+    // 色彩饱和度增�?
+    float luminance = dot(frag_color, vec3(0.299, 0.587, 0.114));
+    frag_color = mix(vec3(luminance), frag_color, 1.5); // 增加饱和�?
+    
+    // 防止过度曝光
+    frag_color = min(frag_color, vec3(1.5));
+    
+    return frag_color;
+}
+
+// 直接输出流体厚度的函�?
+vec3 outputThicknessMap(float thickness) {
+    float scaledThickness = clamp(thickness * 0.5, 0.0, 1.0);
+    return vec3(scaledThickness);
+}
+
+// 用于直接输出流体深度的函�?
+vec3 outputDepthMap(float depth) {
+    // 避免处理无效深度�?
+    if (depth >= 100.0) return vec3(0.0);
+    
+    // 将深度值映射到合适的范围
+    float near = 0.0;  
+    float far = 1.0;  
+    
+    // 使用非线性映射，增强近处细节
+    float normalizedDepth = (far - depth) / (far - near);
+    normalizedDepth = pow(normalizedDepth, 0.5);
+    
+    // 限制在[0,1]范围�?
+    normalizedDepth = clamp(normalizedDepth, 0.0, 1.0);
+    
+    vec3 color;
+    if (normalizedDepth < 0.2) {
+        // 深蓝到浅�?(远处)
+        float t = normalizedDepth / 0.2;
+        color = mix(vec3(0.0, 0.0, 0.5), vec3(0.0, 0.5, 1.0), t);
+    } else if (normalizedDepth < 0.4) {
+        // 浅蓝到青�?
+        float t = (normalizedDepth - 0.2) / 0.2;
+        color = mix(vec3(0.0, 0.5, 1.0), vec3(0.0, 1.0, 1.0), t);
+    } else if (normalizedDepth < 0.6) {
+        // 青色到绿�?
+        float t = (normalizedDepth - 0.4) / 0.2;
+        color = mix(vec3(0.0, 1.0, 1.0), vec3(0.0, 1.0, 0.0), t);
+    } else if (normalizedDepth < 0.8) {
+        // 绿色到黄�?
+        float t = (normalizedDepth - 0.6) / 0.2;
+        color = mix(vec3(0.0, 1.0, 0.0), vec3(1.0, 1.0, 0.0), t);
+    } else {
+        // 黄色到红�?(近处)
+        float t = (normalizedDepth - 0.8) / 0.2;
+        color = mix(vec3(1.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0), t);
+    }
+    return color;
+}
+
+vec3 outputNormalMap(vec2 uv, sampler2D depthTex) {
+    float depth = texture(depthTex, uv).r;
+    if (depth >= 100.0) return vec3(0.0);
+    vec3 normal = computeNormal(uv, depthTex);
+    // [-1, 1] => [0, 1]
+    return normal * 0.5 + 0.5;
+}
+
+// 海洋
+vec3 computeFluidColor3(float depth, float thickness, vec2 uv, vec3 baseColor, sampler2D depthTex) {
+    if (depth >= 100.0) return vec3(0.0);
+
+    // 计算法线 (使用修复版本)
+    vec3 normal = computeNormal(uv, depthTex);
+    
+    // 视线方向
+    vec3 viewDir = -normalize(viewLocationRecon(uv * vec2(imagesize), depthTex));
+    
+    // 海洋蓝色�?
+    vec3 thinOceanColor = vec3(0.5, 0.8, 1.0);    // 薄处亮蓝�?
+    vec3 thickOceanColor = vec3(0.2, 0.5, 0.9);   // 厚处深蓝�?
+    vec3 deepOceanColor = vec3(0.1, 0.3, 0.7);    // 最深处
+    
+    // 根据厚度混合颜色
+    float thicknessFactor = clamp(thickness * 1.5, 0.0, 1.0);
+    vec3 oceanColor = mix(thinOceanColor, thickOceanColor, thicknessFactor);
+    
+    // 光照方向
+    vec3 lightDir = normalize(vec3(0.2, 1.0, 0.5));
+    lightDir = normalize((view * vec4(lightDir, 0.0)).xyz);
+    
+    // 环境光照
+    vec3 ambientLight = vec3(0.25) * oceanColor;
+    
+    // 漫反�?
+    float diffFactor = max(dot(normal, lightDir), 0.0);
+    vec3 diffuse = diffFactor * oceanColor * 0.2;
+    
+    // 高光
+    vec3 halfVector = normalize(viewDir + lightDir);
+    float spec = pow(max(dot(normal, halfVector), 0.0), 256.0);
+    vec3 specular = vec3(spec) * 0.6;
+    
+    // 菲涅�?
+    float F0 = 0.04;
+    float fresnel = Fresnel(max(dot(viewDir, normal), 0.0), F0);
+    fresnel = clamp(fresnel, 0.0, 0.9);
+    
+    // 折射
+    float refractStrength = 0.025 * (1.0 - thicknessFactor * 0.3);
+    vec2 refractCoord = uv + normal.xy * refractStrength;
+    vec3 refractColor = texture(backgroundimage, refractCoord).rgb;
+    
+    // 反射 (Cubemap)
+    vec3 reflectColor = sampleCubemapReflection(viewDir, normal);
+    reflectColor = mix(reflectColor, reflectColor * oceanColor, 0.3);
+    
+    // 吸收 - 海水吸收红光多，蓝光�?
+    vec3 absorptionCoeff = vec3(0.15, 0.08, 0.03);
+    vec3 transmission = exp(-absorptionCoeff * thickness * 2.0);
+    refractColor *= transmission;
+    
+    // 散射 - 海水有明显的散射
+    float scatterFactor = 1.0 - exp(-thickness * 0.5);
+    vec3 scatterColor = oceanColor * 0.2;
+    refractColor += scatterColor * scatterFactor;
+    
+    // 最终混�?
+    vec3 finalColor = mix(refractColor, reflectColor, fresnel);
+    finalColor += specular;
+    finalColor += ambientLight + diffuse;
+    finalColor = mix(finalColor, finalColor * oceanColor, 0.1);
+    
+    return finalColor;
+}
+
+// ==================== PBF风格渲染 (参考PositionBasedFluids项目) ====================
+// 简洁的折射+反射叠加方案，无菲涅尔混�?
+
+// ==================== 焦散计算 (模拟PositionBasedFluids的光子映射方�? ====================
+// PositionBasedFluids使用多pass光子映射�?
+// 1. caustics.frag: 从光源视角计算光子折射终�?(ray marching)
+// 2. causticsPoint: 将光子渲染为点精�?
+// 3. spatialBlur: 高斯模糊焦散纹理
+// 4. sceneWithCaustics: 混合焦散与场�?
+// 
+// 这里在单pass中模拟类似效�?
+// 所有光照参数从UBO统一获取
+
+// 简化的ray marching - 估计折射光线到达场景的位�?
+vec3 simpleRayMarch(vec3 startPos, vec3 dir, float maxDist) {
+    // 使用屏幕空间深度(backdepthimage)做ray marching近似，模拟 PositionBasedFluids 的 ray marching 终点
+    // 目标：在折射方向上推进，并在当前像素处比较 sceneDepth(view space) 来检测“穿透”
+    vec3 posWorld = startPos;
+    vec3 dirWorld = normalize(dir);
+
+    float stepLen = 0.05;
+    int maxSteps = int(maxDist / stepLen);
+    maxSteps = clamp(maxSteps, 1, 256);
+
+    for (int i = 0; i < maxSteps; i++) {
+        vec4 clip = projection * view * vec4(posWorld, 1.0);
+        if (abs(clip.w) < 1e-6) break;
+
+        vec2 uv = clip.xy / clip.w;
+        uv = uv * 0.5 + 0.5;
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
+
+        vec3 scenePosView = viewLocationRecon(uv * vec2(imagesize), backdepthimage);
+        vec3 curPosView = (view * vec4(posWorld, 1.0)).xyz;
+
+        // hit when current point gets behind the scene depth at that pixel
+        if (curPosView.z < scenePosView.z) {
+            return (inv_view * vec4(scenePosView, 1.0)).xyz;
+        }
+
+        posWorld += dirWorld * stepLen;
+    }
+
+    return startPos + dirWorld * maxDist;
+}
+
+// 计算单个光子的焦散贡�?(使用UBO中的光源位置)
+float computePhotonCaustic(vec2 uv, vec3 fluidPosWorld, vec3 normalWorld, float eta) {
+    // 入射光线方向 (从UBO中的lights[0]到水面点)
+    vec3 I = normalize(fluidPosWorld - lights[0].position);
+    
+    // 计算折射方向
+    vec3 R = refract(I, normalWorld, eta);
+    
+    // 全内反射检�?
+    if (length(R) < 0.001) return 0.0;
+    
+    // 估计光子终点位置
+    vec3 terminatePos = simpleRayMarch(fluidPosWorld, R, 5.0);
+    
+    // 将终点位置投影回屏幕空间
+    vec4 clipPos = projection * view * vec4(terminatePos, 1.0);
+    vec2 ndcPos = clipPos.xy / clipPos.w;
+    vec2 screenPos = ndcPos * 0.5 + 0.5;
+    
+    // 计算当前像素与光子终点的距离
+    vec2 diff = (screenPos - uv) * vec2(imagesize);
+    float dist = length(diff);
+    
+    // 光子贡献 - 高斯衰减 (使用UBO中的causticsPhotonRadius)
+    float contribution = exp(-dist * dist / (2.0 * causticsPhotonRadius * causticsPhotonRadius));
+    
+    return contribution;
+}
+
+// PBF风格焦散计算 - 模拟光子映射 (使用UBO中的统一参数)
+// 优化版本：减少采样次�?
+vec3 computeCausticsPBF(vec2 uv, float depth, float thickness, vec3 normalViewSpace, vec3 normalWorldSpace) {
+    if (depth >= 100.0) return vec3(0.0);
+    
+    // 获取当前像素的世界空间位�?
+    vec3 posViewSpace = viewLocationRecon(uv * vec2(imagesize), depthimage);
+    vec3 posWorldSpace = (inv_view * vec4(posViewSpace, 1.0)).xyz;
+    
+    // 采样周围区域的光子贡�?(模拟光子累积)
+    vec3 totalCaustics = vec3(0.0);
+    int sampleCount = 0;
+    
+    // 优化：减少采样半径从3降到1，采样数�?9降到9
+    const int SAMPLE_RADIUS = 1;
+    vec2 texelSize = 1.0 / vec2(imagesize);
+    
+    // 使用UBO中的折射率参数计算色�?
+    float etaRed = 1.0 / redIOR;
+    float etaGreen = 1.0 / greenIOR;
+    float etaBlue = 1.0 / blueIOR;
+    
+    for (int dy = -SAMPLE_RADIUS; dy <= SAMPLE_RADIUS; dy++) {
+        for (int dx = -SAMPLE_RADIUS; dx <= SAMPLE_RADIUS; dx++) {
+            vec2 sampleUV = uv + vec2(float(dx), float(dy)) * texelSize * 6.0;  // 增大步长补偿
+            
+            // 边界检�?
+            if (sampleUV.x < 0.0 || sampleUV.x > 1.0 || sampleUV.y < 0.0 || sampleUV.y > 1.0) continue;
+            
+            // 检查采样点是否有流�?
+            float sampleDepth = texture(depthimage, sampleUV).r;
+            if (sampleDepth >= 100.0) continue;
+            
+            // 获取采样点的位置和法�?
+            vec3 samplePosView = viewLocationRecon(sampleUV * vec2(imagesize), depthimage);
+            vec3 samplePosWorld = (inv_view * vec4(samplePosView, 1.0)).xyz;
+            vec3 sampleNormalView = computeNormal(sampleUV, depthimage);
+            vec3 sampleNormalWorld = normalize(mat3(inv_view) * sampleNormalView);
+            
+            // 计算该采样点发出的光子对当前像素的贡�?
+            // 使用UBO中的色散折射�?- RGB分别计算
+            float convergenceR = computePhotonCaustic(uv, samplePosWorld, sampleNormalWorld, etaRed);
+            float convergenceG = computePhotonCaustic(uv, samplePosWorld, sampleNormalWorld, etaGreen);
+            float convergenceB = computePhotonCaustic(uv, samplePosWorld, sampleNormalWorld, etaBlue);
+            
+            totalCaustics += vec3(convergenceR, convergenceG, convergenceB);
+            sampleCount++;
+        }
+    }
+    
+    if (sampleCount == 0) return vec3(0.0);
+    
+    // 归一化并应用UBO中的焦散强度
+    totalCaustics = totalCaustics / float(sampleCount) * causticsIntensity;
+    
+    // 厚度衰减 - 厚的水体焦散更弱
+    float thicknessAtten = exp(-thickness * 0.2);
+    
+    // 深度衰减
+    float depthAtten = 1.0 - clamp(depth * 0.05, 0.0, 0.7);
+    
+    // 应用衰减
+    totalCaustics *= thicknessAtten * depthAtten;
+    
+    // 增强对比�?
+    totalCaustics = pow(totalCaustics, vec3(0.8)) * 2.0;
+    
+    return clamp(totalCaustics, vec3(0.0), vec3(1.0));
+}
+
+// PBF风格渲染主函�?(使用UBO中的统一折射�?
+vec3 computeFluidColorPBF(float depth, float thickness, vec2 uv, vec3 fluidColor, sampler2D depthTex) {
+    if (depth >= 100.0) return vec3(0.0);
+    
+    // 计算法线（视空间�?
+    vec3 normalViewSpace = computeNormal(uv, depthTex);
+    
+    // 将法线从视空间转换到世界空间
+    vec3 normalWorldSpace = normalize(mat3(inv_view) * normalViewSpace);
+    
+    // 视线方向（世界空间）
+    vec3 viewPosWorld = (inv_view * vec4(viewLocationRecon(uv * vec2(imagesize), depthTex), 1.0)).xyz;
+    vec3 I = normalize(camera_pos - viewPosWorld);
+    vec3 N = normalWorldSpace;
+    
+    // ===== 折射 =====
+    // 衰减因子 (Beer-Lambert)
+    vec3 attenuationFactor = exp(-(vec3(1.0) - fluidColor) * thickness);
+    
+    // 使用UBO中的折射�?
+    float ior = 1.0 / refractionIOR;
+    vec3 R = refract(-I, N, ior);
+    
+    // 折射偏移 - 使用折射方向的y分量控制
+    float refractScaler = R.y * 0.025;
+    vec2 texCoordRefract = uv + normalViewSpace.xy * refractScaler;
+    texCoordRefract = clamp(texCoordRefract, vec2(0.001), vec2(0.999));
+    
+    // 采样背景并应用衰�?
+    vec3 sceneRefract = texture(backgroundimage, texCoordRefract).rgb;
+    float causticsMask = texture(causticsimage, texCoordRefract).r;
+    vec3 caustics = sceneRefract * (causticsMask * causticsIntensity);
+    vec3 colorRefract = (sceneRefract + caustics) * attenuationFactor;
+    
+    // ===== 反射 =====
+    // 反射方向（世界空间）
+    vec3 reflectDirWorld = reflect(-I, N);
+    
+    // 采样Cubemap
+    vec3 colorReflect = texture(skyboxCubemap, reflectDirWorld).rgb;
+    
+    // ===== 最终混�?=====
+    // 简单叠加：折射 + 反射 * 0.75 (与fluid.frag一�?
+    vec3 result = colorRefract + colorReflect * 0.75;
+    
+    return result;
+}
+
+void main() {
+    ivec2 outcoord = ivec2(gl_GlobalInvocationID.xy);
+    imagesize = imageSize(dstimage);
+
+    if (outcoord.x >= imagesize.x || outcoord.y >= imagesize.y) return;
+
+    vec2 centerCoord = vec2(outcoord.x + 0.5, outcoord.y + 0.5);
+    float u = centerCoord.x / imagesize.x;
+    float v = centerCoord.y / imagesize.y;
+    vec2 uv = vec2(u, v);
+    
+    // 采样流体粒子数据
+    float depth_fluid = texture(depthimage, uv).r;
+    float thickness_fluid = texture(thicknessimage, uv).r;
+
+    // 采样刚体粒子数据
+    float depth_cube = texture(depthimage2, uv).r;
+    float thickness_cube = texture(thicknessimage2, uv).r * 1.5; 
+
+    vec4 bgcolor = texture(backgroundimage, uv);
+
+    // 如果没有粒子，直接使用背景色
+    if (depth_fluid >= 100.0 && depth_cube >= 100.0) {
+        imageStore(dstimage, outcoord, bgcolor);
+        return;
+    }
+    // 如果背景图深度更小，直接使用背景�?
+    float depth_back = texture(backdepthimage, uv).r;
+    if (depth_back < depth_fluid && depth_back < depth_cube) {
+        imageStore(dstimage, outcoord, bgcolor);
+        return;
+    }
+
+    vec3 baseFluidColor = fluid_color.xyz;
+
+    // 分别计算流体和刚体的颜色
+    vec3 color_fluid = vec3(0.0, 0.0, 0.0);
+    if (renderType == 0) {
+        if (fluidType == 0)
+            color_fluid = computeFluidColor(depth_fluid, thickness_fluid, uv, baseFluidColor, depthimage);
+        else if (fluidType == 1)
+            color_fluid = computeMilkColor(depth_fluid, thickness_fluid, uv, baseFluidColor, depthimage);
+        else if (fluidType == 2)
+            color_fluid = computeOrangeJuiceColor(depth_fluid, thickness_fluid, uv, baseFluidColor, depthimage);
+        else if (fluidType == 3)
+            color_fluid = computeHoneyColor(depth_fluid, thickness_fluid, uv, baseFluidColor, depthimage);
+        else if (fluidType == 4) 
+            color_fluid = computeFluidColor2(depth_fluid, thickness_fluid, uv, baseFluidColor, depthimage);
+        else if (fluidType == 5)
+            color_fluid = computeFluidColor3(depth_fluid, thickness_fluid, uv, baseFluidColor, depthimage);
+        else if (fluidType == 6)
+            color_fluid = computeFluidColorPBF(depth_fluid, thickness_fluid, uv, baseFluidColor, depthimage);
+    }
+    else if (renderType == 1)
+        color_fluid = outputThicknessMap(thickness_fluid);
+    else if (renderType == 2)
+        color_fluid = outputDepthMap(depth_fluid);
+    else 
+        color_fluid = outputNormalMap(uv, depthimage);
+    vec3 color_cube = computeMetalColor(depth_cube, thickness_cube, uv, vec3(0.9, 0.9, 0.9), depthimage2);
+
+    // 对比度混�?
+    vec3 final_color;
+    if (depth_fluid >= 100.0) {
+        // 只有刚体
+        final_color = color_cube;
+    } else if (depth_cube >= 100.0) {
+        // 只有流体
+        final_color = color_fluid;
+    } else {
+        if (depth_cube < depth_fluid) {
+            // 刚体在前 - 绝对不透明
+            final_color = color_cube;
+        } else {
+            // 流体在前
+            float mix_factor = 0.15;
+            float alpha = 1.0 - exp(-thickness_fluid * 0.7);
+            if (fluidType == 1) mix_factor = 0.05;
+            if (fluidType == 2) mix_factor = 0.10;
+            if (fluidType == 3) mix_factor = 0.02; 
+            final_color = mix(color_fluid, color_cube * 0.4, mix_factor); 
+        }
+    }
+    imageStore(dstimage, outcoord, vec4(final_color, 1.0));
+}

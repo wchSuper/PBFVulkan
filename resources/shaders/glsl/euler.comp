@@ -1,0 +1,37 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+
+#include "simulationcommon.h"
+
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+
+
+void main() {
+    
+    uint particleindex = gl_GlobalInvocationID.x;
+
+    if (particleindex < numParticles){
+        // 重力
+        particlesOut[particleindex].Velocity = particlesIn[particleindex].Velocity + vec3(0,-9.8,0) * dt;
+
+        // 鼠标交互力
+        vec3 mp = mouse_pos;
+        vec3 p = particlesOut[particleindex].Location.xyz;
+        vec3 r = p - mp;
+        float len = length(r);
+        len += 0.1;
+        if (len < 0.5)
+            particlesOut[particleindex].Velocity += attract * k * r * dt / (len * len * len);
+
+        particlesOut[particleindex].Velocity += computeDynamicWaveVelocity(particlesIn[particleindex].Location.xyz, accumulated_t, particleindex);
+
+        particlesOut[particleindex].Location = particlesIn[particleindex].Location + particlesOut[particleindex].Velocity * dt;
+    }
+    
+    uint base_num = maxParticles + maxCubeParticles;
+    uint max_num = base_num + rigidParticles;
+    if (particleindex >= base_num && particleindex < max_num) {
+        rigidParticlesInfo[particleindex - base_num].Location += 0.5 * vec3(0,-200,0) * dt * dt;
+        // rigidParticlesInfo[particleindex - base_num].Location += 0.5 * vec3(0,-9.8,0) * accumulated_t * accumulated_t;
+    }
+}

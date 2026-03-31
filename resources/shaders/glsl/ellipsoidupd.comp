@@ -1,0 +1,222 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_include : require
+#include "simulationcommon.h"
+
+// 椭球动力学参数
+const float ELLIPSOID_MASS = 1000.0;           // 椭球质量
+const float INV_MASS = 1.0 / ELLIPSOID_MASS;   // 逆质量
+const float LINEAR_DAMPING = 0.92;             // 线速度阻尼
+const float ANGULAR_DAMPING = 0.90;            // 角速度阻尼
+
+// 船体稳定性参数
+const float MAX_TILT_ANGLE = 35.0;             // 最大倾斜角度（度）
+const float UPRIGHTING_STRENGTH = 200.0;      // 复原力矩强度
+const float UPRIGHTING_DAMPING = 80.0;
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+// 四元数乘法
+vec4 quatMult(vec4 q1, vec4 q2) {
+    return vec4(
+        q1.w * q2.x + q1.x * q2.w + q1.y * q2.z - q1.z * q2.y,
+        q1.w * q2.y - q1.x * q2.z + q1.y * q2.w + q1.z * q2.x,
+        q1.w * q2.z + q1.x * q2.y - q1.y * q2.x + q1.z * q2.w,
+        q1.w * q2.w - q1.x * q2.x - q1.y * q2.y - q1.z * q2.z
+    );
+}
+
+// 四元数归一化
+vec4 quatNormalize(vec4 q) {
+    float len = sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    return q / len;
+}
+
+// 四元数共轭
+vec4 quatConjugate(vec4 q) {
+    return vec4(-q.x, -q.y, -q.z, q.w);
+}
+
+// 四元数转旋转矩阵
+mat4 quatToMat4(vec4 q) {
+    float xx = q.x * q.x;
+    float yy = q.y * q.y;
+    float zz = q.z * q.z;
+    float xy = q.x * q.y;
+    float xz = q.x * q.z;
+    float yz = q.y * q.z;
+    float wx = q.w * q.x;
+    float wy = q.w * q.y;
+    float wz = q.w * q.z;
+    
+    mat4 result = mat4(1.0);
+    result[0][0] = 1.0 - 2.0 * (yy + zz);
+    result[0][1] = 2.0 * (xy + wz);
+    result[0][2] = 2.0 * (xz - wy);
+    
+    result[1][0] = 2.0 * (xy - wz);
+    result[1][1] = 1.0 - 2.0 * (xx + zz);
+    result[1][2] = 2.0 * (yz + wx);
+    
+    result[2][0] = 2.0 * (xz + wy);
+    result[2][1] = 2.0 * (yz - wx);
+    result[2][2] = 1.0 - 2.0 * (xx + yy);
+    
+    result[3][3] = 1.0;
+    return result;
+}
+
+// 计算椭球的惯性张量的逆（简化版本，假设均匀密度）
+mat3 computeInvInertiaTensor(vec3 radii, float mass) {
+    float a = radii.x, b = radii.y, c = radii.z;
+    float m = mass;
+    
+    // 惯性张量对角元素
+    float Ixx = m * (b*b + c*c) / 5.0;
+    float Iyy = m * (a*a + c*c) / 5.0;
+    float Izz = m * (a*a + b*b) / 5.0;
+    
+    // 逆惯性张量（对角矩阵的逆就是对角元素取倒数）
+    return mat3(
+        1.0/Ixx, 0, 0,
+        0, 1.0/Iyy, 0,
+        0, 0, 1.0/Izz
+    );
+}
+
+void main() {
+    // =================== 1. 从model矩阵提取当前位置 ===================
+    vec3 currentPos = vec3(model[3][0], model[3][1], model[3][2]);
+    
+    // =================== 2. 应用力到线速度 ===================
+    vec3 gravity = vec3(0.0, -4.8, 0.0);
+    vec3 acceleration = accumulatedForce * INV_MASS + gravity;
+    velocity += acceleration * dt;
+    
+    // =================== 3. 应用力矩到角速度 ===================
+    mat3 invI = computeInvInertiaTensor(radii, ELLIPSOID_MASS);
+    vec3 angularAcceleration = invI * accumulatedTorque;
+    angularVelocity += angularAcceleration * dt;
+    
+    // =================== 4. 更新位置 ===============================
+    currentPos += velocity * dt;
+    
+    // =================== 5. 边界约束 =======================
+    for (int axis = 0; axis < 3; ++axis) {
+        vec2 clamp = (axis == 0) ? boxClampX : ((axis == 1) ? boxClampY : boxClampZ);
+        float minBound = clamp.x + radii[axis];
+        float maxBound = clamp.y - radii[axis];
+        
+        if (currentPos[axis] < minBound) {
+            currentPos[axis] = minBound;
+            velocity[axis] = 0.0;
+        }
+        if (currentPos[axis] > maxBound) {
+            currentPos[axis] = maxBound;
+            velocity[axis] = 0.0;
+        }
+    }
+    
+    // =================== 6. SDF碰撞约束 ===================
+    if (isSDF) {
+        vec3 sdfRangeMax = sdfRangeMin + voxelResolution * voxelSize;
+        
+        // 检查椭球中心是否在SDF范围内
+        if (currentPos.x >= sdfRangeMin.x && currentPos.y >= sdfRangeMin.y && currentPos.z >= sdfRangeMin.z &&
+            currentPos.x <= sdfRangeMax.x && currentPos.y <= sdfRangeMax.y && currentPos.z <= sdfRangeMax.z) {
+            
+            // 计算体素坐标
+            uint vx = uint((currentPos.x - sdfRangeMin.x) / voxelSize);
+            uint vy = uint((currentPos.y - sdfRangeMin.y) / voxelSize);
+            uint vz = uint((currentPos.z - sdfRangeMin.z) / voxelSize);
+            
+            float sdfValue = SampleSDF(voxelResolution, vx, vy, vz);
+            float maxRadius = max(radii.x, max(radii.y, radii.z));
+            
+            // 如果椭球表面穿透SDF模型
+            if (sdfValue < maxRadius) {
+                // 计算SDF梯度（法线方向）
+                vec3 normal = SampleSDFGrad(voxelResolution, vx, vy, vz);
+                normal = SafeRandNormalize(normal, 0);
+                
+                // 推开椭球
+                float penetration = maxRadius - sdfValue;
+                vec3 correction = penetration * normal;
+                currentPos += correction;
+                
+                // 速度阻尼（类似粘滞碰撞）
+                float vn = dot(velocity, normal);
+                if (vn < 0.0) {
+                    // 法向速度分量
+                    vec3 vNormal = vn * normal;
+                    // 切向速度分量
+                    vec3 vTangent = velocity - vNormal;
+                    
+                    // 应用阻尼
+                    float sdfPenetrationRatio = clamp(penetration / maxRadius, 0.0, 1.0);
+                    float normalDamping = 0.3 + 0.5 * sdfPenetrationRatio;
+                    float tangentDamping = 0.95;
+                    
+                    velocity = vTangent * tangentDamping - vNormal * normalDamping;
+                }
+            }
+        }
+    }
+    
+    // =================== 7. 船体稳定性控制 ===================
+    // 让船的姿态（roll/pitch/yaw）缓慢回到初始方向（单位四元数）
+    vec4 targetOrientation = vec4(0.0, 0.0, 0.0, 1.0);
+    vec4 qErr = quatMult(targetOrientation, quatConjugate(orientation));
+    if (qErr.w < 0.0) {
+        qErr = -qErr;
+    }
+    qErr = quatNormalize(qErr);
+
+    float errW = clamp(qErr.w, -1.0, 1.0);
+    float angle = 2.0 * acos(errW);
+    float sinHalf = sqrt(max(1.0 - errW * errW, 0.0));
+
+    if (sinHalf > 0.001) {
+        vec3 axis = qErr.xyz / sinHalf;
+        vec3 restoringTorque = axis * (UPRIGHTING_STRENGTH * angle) - angularVelocity * UPRIGHTING_DAMPING;
+        angularVelocity += invI * restoringTorque * dt;
+    }
+    
+    // =================== 8. 更新旋转（四元数积分） ===================
+    float angularSpeed = length(angularVelocity);
+    if (angularSpeed > 0.0001) {
+        vec3 axis = normalize(angularVelocity);
+        float angle = angularSpeed * dt;
+        
+        float halfAngle = angle * 0.5;
+        vec4 deltaQ = vec4(
+            sin(halfAngle) * axis.x,
+            sin(halfAngle) * axis.y,
+            sin(halfAngle) * axis.z,
+            cos(halfAngle)
+        );
+        
+        orientation = quatMult(deltaQ, orientation);
+        orientation = quatNormalize(orientation);
+    }
+    
+    // =================== 9. 应用阻尼 ===================
+    velocity *= LINEAR_DAMPING;
+    angularVelocity *= ANGULAR_DAMPING;
+    
+    // =================== 10. 重构model矩阵 (Translation * Rotation) ===================
+    mat4 rotation = quatToMat4(orientation);
+    mat4 translation = mat4(1.0);
+    translation[3][0] = currentPos.x;
+    translation[3][1] = currentPos.y;
+    translation[3][2] = currentPos.z;
+    
+    model = translation * rotation;
+    
+    // center保持与model同步（仅用于compute shader中的碰撞检测）
+    center = currentPos;
+    
+    // =================== 11. 清零累积力（准备下一帧） ===================
+    accumulatedForce = vec3(0.0);
+    accumulatedTorque = vec3(0.0);
+}

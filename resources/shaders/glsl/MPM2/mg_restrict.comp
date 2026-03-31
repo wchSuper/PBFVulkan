@@ -1,0 +1,50 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#include "mpm2common.h"
+#include "mg_common.h"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 6) buffer RHS { float rhs[]; };
+layout(std430, set = 0, binding = 7) buffer Residual { float res[]; };
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    int nC = mg.n;
+    uint count = uint(nC * nC * nC);
+    if (tid >= count) return;
+
+    int xC = int(tid) / (nC * nC);
+    int yC = (int(tid) / nC) % nC;
+    int zC = int(tid) % nC;
+
+    uint coarseBase = uint(mg.coarseOffset);
+    uint fineBase = uint(mg.levelOffset);
+
+    uint outIdx = coarseBase + tid;
+
+    if (xC <= 0 || yC <= 0 || zC <= 0 || xC >= nC - 1 || yC >= nC - 1 || zC >= nC - 1) {
+        rhs[outIdx] = 0.0;
+        return;
+    }
+
+    int nF = nC * 2;
+    int xF0 = xC * 2;
+    int yF0 = yC * 2;
+    int zF0 = zC * 2;
+
+    float sum = 0.0;
+    for (int dx = 0; dx < 2; ++dx) {
+        for (int dy = 0; dy < 2; ++dy) {
+            for (int dz = 0; dz < 2; ++dz) {
+                int xF = xF0 + dx;
+                int yF = yF0 + dy;
+                int zF = zF0 + dz;
+                int fineId = xF * nF * nF + yF * nF + zF;
+                sum += res[fineBase + uint(fineId)];
+            }
+        }
+    }
+
+    rhs[outIdx] = sum * 0.125;
+}

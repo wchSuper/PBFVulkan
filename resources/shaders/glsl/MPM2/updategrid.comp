@@ -1,0 +1,54 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#include "mpm2common.h"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+
+    if (id >= cellCount) {
+        return;
+    }
+
+    if (cells[id].mass > 0) {
+        float m = decodeFixedPoint(cells[id].mass);
+        if (m <= 1e-6) {
+            cells[id].mass = 0;
+            cells[id].vx = 0;
+            cells[id].vy = 0;
+            cells[id].vz = 0;
+            return;
+        }
+        vec3 float_v = vec3(
+            decodeFixedPoint(cells[id].vx),
+            decodeFixedPoint(cells[id].vy),
+            decodeFixedPoint(cells[id].vz)
+        );
+        float_v /= m;
+
+        float_v.y += gravity * (real_box_size.y / world_size.y) * dt;
+
+        int x = int(id) / int(init_box_size.z) / int(init_box_size.y);
+        int y = (int(id) / int(init_box_size.z)) % int(init_box_size.y);
+        int z = int(id) % int(init_box_size.z);
+
+        int xMax = int(ceil(real_box_size.x) - 3.0);
+        int yMax = int(ceil(real_box_size.y) - 3.0);
+        int zMax = int(ceil(real_box_size.z) - 3.0);
+
+        if (x < 2 && float_v.x < 0.0) { float_v.x = 0.0; }
+        if (x > xMax && float_v.x > 0.0) { float_v.x = 0.0; }
+        if (z < 2 && float_v.z < 0.0) { float_v.z = 0.0; }
+        if (z > zMax && float_v.z > 0.0) { float_v.z = 0.0; }
+        if (y < 2 && float_v.y < 0.0) { float_v.y = 0.0; }
+        if (y > yMax && float_v.y > 0.0) { float_v.y = 0.0; }
+
+        float v_allowed = (dt > 0.0) ? (0.9 / dt) : 0.0;
+        float_v = clamp(float_v, vec3(-v_allowed), vec3(v_allowed));
+
+        cells[id].vx = encodeFixedPoint(float_v.x);
+        cells[id].vy = encodeFixedPoint(float_v.y);
+        cells[id].vz = encodeFixedPoint(float_v.z);
+    }
+}

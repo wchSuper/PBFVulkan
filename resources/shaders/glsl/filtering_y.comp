@@ -1,0 +1,99 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#include "renderingcommon.h"
+
+// 垂直方向滤波（Y方向）
+layout(binding=1) uniform sampler2D old_depthtexture;
+layout(binding=2,r32f) uniform writeonly image2D filtered_depthtexture;
+
+layout(local_size_x=4,local_size_y=4,local_size_z=1) in;
+
+// 从深度重建视图空间位置（用于计算视距）
+vec3 viewLocationRecon(vec2 coord, ivec2 imgSize) {
+    float u = coord.x / imgSize.x;
+    float v = coord.y / imgSize.y;
+    float d = texture(old_depthtexture, vec2(u, v)).r;
+    
+    // 处理无效深度
+    if (d >= 100.0) return vec3(0.0, 0.0, -1000.0);
+    
+    vec4 ndcLocation = vec4(u * 2.0 - 1.0, v * 2.0 - 1.0, d, 1.0);
+    float clipw = 1.0 / ((inv_projection * ndcLocation).w);
+    vec4 viewLocation = clipw * inv_projection * ndcLocation;
+    return viewLocation.xyz;
+}
+
+void main() {
+    ivec2 outcoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imagesize = imageSize(filtered_depthtexture);
+    
+    if(outcoord.x >= imagesize.x || outcoord.y >= imagesize.y) return;
+
+    float u = (outcoord.x + 0.5)/imagesize.x;
+    float v = (outcoord.y + 0.5)/imagesize.y;
+
+    float depth = texture(old_depthtexture,vec2(u,v)).r;
+    
+    if (!isFilter) {
+        imageStore(filtered_depthtexture,outcoord,vec4(depth,0,0,0));
+        return;
+    }
+    
+    // ===== 自适应滤波半径 =====
+    // 计算视距
+    vec3 viewPos = viewLocationRecon(vec2(outcoord), imagesize);
+    float viewDistance = length(viewPos);
+    // viewDistance = depth;
+    
+    // 自适应半径计算：相机越近，半径越大
+    // 基础半径从 filterRadius 开始
+    // 近距离时（viewDistance < 5）显著增大半径
+    float distanceFactor = 1.0;
+    if (viewDistance < 10.0 && viewDistance > 0.1) {
+        // 在距离10以内，半径随距离反比增长
+        // viewDistance = 1.0 → distanceFactor ≈ 6.0
+        // viewDistance = 5.0 → distanceFactor ≈ 2.0
+        // viewDistance = 10.0 → distanceFactor = 1.0
+        distanceFactor = 1.0 + 5.0 / viewDistance;
+    }
+    
+    // 计算最终半径，限制最大值避免性能问题
+    float adaptiveRadius = float(filterRadius) * distanceFactor;
+    int r = int(min(adaptiveRadius, 50.0));
+    
+    float wsum = 0;
+    float sum = 0;
+    
+    // 仅在Y方向滤波
+    for(float dy=-r; dy<=r; ++dy){
+        float u_d = u;
+        float v_d = v + dy/imagesize.y;
+        float d_d;
+        
+        if(v_d<0 || v_d>1) {
+            d_d = 1000;
+        }
+        else {
+            d_d = texture(old_depthtexture,vec2(u_d,v_d)).r;
+        }
+        
+        // 空间权重（仅Y方向）
+        // 自适应调整空间权重：半径大时减小系数，使滤波范围更广
+        float spatialCoeff = 0.1 / max(distanceFactor, 1.0);
+        float coeff_c = -spatialCoeff * (dy*dy);
+        
+        // 范围权重（深度差）
+        // 近距离时增大深度容差
+        float depthScale = 1.0 + 2.0 * max(distanceFactor - 1.0, 0.0);
+        float coeff_s = -(depth-d_d)*(depth-d_d) / depthScale;
+        
+        float coeff = exp(coeff_c + coeff_s);
+        
+        wsum += coeff;
+        sum += coeff * d_d;
+    }
+    
+    sum /= wsum;
+    depth = sum;
+    imageStore(filtered_depthtexture,outcoord,vec4(depth,0,0,0));
+}

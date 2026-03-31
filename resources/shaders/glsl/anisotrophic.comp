@@ -1,0 +1,354 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#include "simulationcommon.h"
+
+struct AnisotrophicMatrix {
+    vec3 aniMtCol0;
+    vec3 aniMtCol1;
+    vec3 aniMtCol2;
+};
+
+layout(binding=17) buffer AnisotrophicBuffer{
+    AnisotrophicMatrix anisotrophicMatrices[];
+};
+
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+
+// Jacobi 特征分解（对称 3x3）
+// 输入对称矩阵 A，输出特征值 lambda（降序）和特征向量矩阵 R（列为特征向量）
+void eigenDecompositionSymmetric(mat3 A, out vec3 lambda, out mat3 R) {
+    // 检查A是否为有效的对称矩阵
+    mat3 origA = A;  // 保存原始矩阵用于验证
+    
+    // 确保A是对称矩阵
+    A[0][1] = A[1][0] = (A[0][1] + A[1][0]) * 0.5;
+    A[0][2] = A[2][0] = (A[0][2] + A[2][0]) * 0.5;
+    A[1][2] = A[2][1] = (A[1][2] + A[2][1]) * 0.5;
+
+    R = mat3(1.0);
+    const int MAX_SWEEPS = 16; // 增加迭代次数以提高精度
+    
+    // 对角矩阵可以直接返回
+    bool isDiagonal = true;
+    float epsilon = 1e-5;
+    for (int i = 0; i < 3 && isDiagonal; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            if (i != j && abs(A[i][j]) > epsilon) {
+                isDiagonal = false;
+                break;
+            }
+        }
+    }
+    if (isDiagonal) {
+        lambda = vec3(A[0][0], A[1][1], A[2][2]);
+        // 确保特征值为正
+        lambda = max(lambda, vec3(1e-5));
+        return;
+    }
+    
+    // Jacobi迭代
+    for (int sweep = 0; sweep < MAX_SWEEPS; ++sweep) {
+        // 找到最大的非对角元素
+        float maxOffDiag = 0.0;
+        int p = 0, q = 1;
+        
+        for (int i = 0; i < 3; ++i) {
+            for (int j = i+1; j < 3; ++j) {
+                if (abs(A[i][j]) > maxOffDiag) {
+                    maxOffDiag = abs(A[i][j]);
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+        
+        // 判断是否收敛
+        if (maxOffDiag < 1e-6) {
+            break;
+        }
+        
+        // 计算Jacobi旋转
+        float app = A[p][p];
+        float apq = A[p][q];
+        float aqq = A[q][q];
+        
+        // 计算旋转角度
+        float diff = aqq - app;
+        float theta = 0.5 * atan(2.0 * apq, abs(diff) < 1e-6 ? 1e-6 : diff);
+        float c = cos(theta);
+        float s = sin(theta);
+        
+        // 更新矩阵A
+        float appNew = c*c*app - 2.0*s*c*apq + s*s*aqq;
+        float aqqNew = s*s*app + 2.0*s*c*apq + c*c*aqq;
+        
+        A[p][p] = appNew;
+        A[q][q] = aqqNew;
+        A[p][q] = A[q][p] = 0.0;
+        
+        // 更新其他元素
+        for (int i = 0; i < 3; ++i) {
+            if (i != p && i != q) {
+                float api = c*A[p][i] - s*A[q][i];
+                float aqi = s*A[p][i] + c*A[q][i];
+                A[p][i] = A[i][p] = api;
+                A[q][i] = A[i][q] = aqi;
+            }
+        }
+        
+        // 更新特征向量
+        for (int i = 0; i < 3; ++i) {
+            float rpi = c*R[i][p] - s*R[i][q];
+            float rqi = s*R[i][p] + c*R[i][q];
+            R[i][p] = rpi;
+            R[i][q] = rqi;
+        }
+    }
+    
+    // 提取特征值（对角线元素）
+    lambda = vec3(A[0][0], A[1][1], A[2][2]);
+    
+    // 确保特征值为正且按降序排列
+    lambda = max(lambda, vec3(1e-5));
+    
+    // 冒泡排序特征值和特征向量
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2-i; ++j) {
+            if (lambda[j] < lambda[j+1]) {
+                // 交换特征值
+                float tempVal = lambda[j];
+                lambda[j] = lambda[j+1];
+                lambda[j+1] = tempVal;
+                
+                // 交换特征向量（列）
+                for (int k = 0; k < 3; ++k) {
+                    float tempVec = R[k][j];
+                    R[k][j] = R[k][j+1];
+                    R[k][j+1] = tempVec;
+                }
+            }
+        }
+    }
+    
+    // 校正特征向量符号（使第一个非零元素为正）
+    for (int j = 0; j < 3; ++j) {
+        bool flipped = false;
+        for (int i = 0; i < 3; ++i) {
+            if (abs(R[i][j]) > 1e-6) {
+                if (R[i][j] < 0.0) {
+                    for (int k = 0; k < 3; ++k) {
+                        R[k][j] = -R[k][j];
+                    }
+                }
+                break;
+            }
+        }
+    }
+    
+    // 验证结果 - 如果不正确则回退到简单方案
+    bool valid = true;
+    // 构建对角矩阵 Λ（GLSL列主序）
+    mat3 Lambda = mat3(
+        lambda.x, 0.0, 0.0,      // 第0列
+        0.0, lambda.y, 0.0,      // 第1列
+        0.0, 0.0, lambda.z       // 第2列
+    );
+    mat3 testMat = R * Lambda * transpose(R);
+    
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            if (abs(testMat[i][j] - origA[i][j]) > 0.1 * max(1.0, abs(origA[i][j]))) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) break;
+    }
+    
+    if (!valid) {
+        // 简化版本 - 使用对角元素作为近似特征值
+        lambda = vec3(origA[0][0], origA[1][1], origA[2][2]);
+        lambda = max(lambda, vec3(1e-5));
+        // 使用默认的特征向量（单位矩阵）
+        R = mat3(1.0);
+    }
+}
+
+void main()
+{
+    uint globalindex = gl_GlobalInvocationID.x;
+    if(globalindex >= numParticles) return;
+
+    vec3 pos = particlesOut[globalindex].Location.xyz;
+    vec3 boundary = boundary_min;
+
+    // 粒子所在的cell index
+    vec3 normalized_idx = ((pos - boundary) / (0.01 * 2));
+    uint cellindex = FlatCell(normalized_idx);
+    
+    // 最大邻居索引
+    uint num_ngbrs = neighborCpyCount[cellindex] + cellOffset[cellindex - 1];
+    // 起始邻居
+    uint start_ngbr = cellOffset[cellindex - 1];
+    // 最大邻居数
+    uint max_ngbrs = maxNgbrs;
+    uint ngbr_cnt = 0;
+
+    // 计算加权中心位置 x_i^w (WPCA)
+    vec3 weightedCenter = vec3(0.0);
+    float totalWeight = 0.0;
+
+    for (uint i = 0; i < 27; ++i)
+    {
+        vec3 ngbr_cell_idx = normalized_idx + cell_offset[i];
+        if (ngbr_cell_idx.x < 0 || ngbr_cell_idx.y < 0 || ngbr_cell_idx.z < 0) continue;
+        uint flatted_cell_idx = FlatCell(ngbr_cell_idx);
+        num_ngbrs = neighborCpyCount[flatted_cell_idx] + cellOffset[flatted_cell_idx - 1];
+        start_ngbr = cellOffset[flatted_cell_idx - 1];
+
+        for (uint ngbr = start_ngbr; ngbr < num_ngbrs; ++ngbr)
+        {
+            if (ngbr_cnt >= max_ngbrs) break;
+            uint mapped_ngbr = testPBF[ngbr];
+            if (mapped_ngbr == globalindex) continue;
+            if (mapped_ngbr >= maxParticles && mapped_ngbr < maxParticles + cubeParticleNum) {
+                continue;
+            }
+            if (mapped_ngbr >= maxParticles + maxCubeParticles && mapped_ngbr < maxParticles + maxCubeParticles + rigidParticles) {
+                continue;
+            }
+            vec3 neighborPos = particlesOut[mapped_ngbr].Location.xyz;
+            vec3 r = pos - neighborPos;
+            float weight = W_Poly6(r, sphRadius);
+            weightedCenter += neighborPos * weight;
+            totalWeight += weight;
+            ++ngbr_cnt;
+        }
+        if (ngbr_cnt >= max_ngbrs) break;
+    }
+    
+    // 计算加权中心
+    float wnorm = max(totalWeight, 0.001);
+    weightedCenter /= wnorm;
+    
+    // 重置计数器和权重
+    ngbr_cnt = 0;
+    totalWeight = 0.0;
+    
+    // 计算协方差矩阵 C_i
+    mat3 covMatrix = mat3(0.0);
+    for (uint i = 0; i < 27; ++i)
+    {
+        vec3 ngbr_cell_idx = normalized_idx + cell_offset[i];
+        if (ngbr_cell_idx.x < 0 || ngbr_cell_idx.y < 0 || ngbr_cell_idx.z < 0) continue;
+        uint flatted_cell_idx = FlatCell(ngbr_cell_idx);
+        num_ngbrs = neighborCpyCount[flatted_cell_idx] + cellOffset[flatted_cell_idx - 1];
+        start_ngbr = cellOffset[flatted_cell_idx - 1];
+
+        for (uint ngbr = start_ngbr; ngbr < num_ngbrs; ++ngbr)
+        {
+            if (ngbr_cnt >= max_ngbrs) break;
+            uint mapped_ngbr = testPBF[ngbr];
+            if (mapped_ngbr == globalindex) continue;
+            if (mapped_ngbr >= maxParticles && mapped_ngbr < maxParticles + cubeParticleNum) {
+                continue;
+            }
+            if (mapped_ngbr >= maxParticles + maxCubeParticles && mapped_ngbr < maxParticles + maxCubeParticles + rigidParticles) {
+                continue;
+            }
+            vec3 neighborPos = particlesOut[mapped_ngbr].Location.xyz;
+            vec3 r = pos - neighborPos;
+            float weight = W_Poly6(r, sphRadius);
+            
+            // 计算相对于加权中心的向量
+            vec3 dx = neighborPos - weightedCenter;
+            
+            // 构建协方差矩阵 C = (dx ⊗ dx) * weight
+            covMatrix[0][0] += weight * dx.x * dx.x;  // C_xx
+            covMatrix[1][0] += weight * dx.x * dx.y;  // C_xy (第1列第0行)
+            covMatrix[2][0] += weight * dx.x * dx.z;  // C_xz (第2列第0行)
+            covMatrix[0][1] += weight * dx.y * dx.x;  // C_yx (第0列第1行)
+            covMatrix[1][1] += weight * dx.y * dx.y;  // C_yy
+            covMatrix[2][1] += weight * dx.y * dx.z;  // C_yz (第2列第1行)
+            covMatrix[0][2] += weight * dx.z * dx.x;  // C_zx (第0列第2行)
+            covMatrix[1][2] += weight * dx.z * dx.y;  // C_zy (第1列第2行)
+            covMatrix[2][2] += weight * dx.z * dx.z;  // C_zz
+            
+            totalWeight += weight;
+            ++ngbr_cnt;
+        }
+        if (ngbr_cnt >= max_ngbrs) break;
+    }
+    // 归一化协方差矩阵
+    covMatrix /= max(totalWeight, 0.001);
+
+    // 添加正则化项，避免奇异矩阵
+    float minThickness = fluidParticleRadius * fluidParticleRadius * 0.01; // 约为粒子间距的1%
+    covMatrix[0][0] += minThickness;
+    covMatrix[1][1] += minThickness;
+    covMatrix[2][2] += minThickness;
+
+    // 计算特征值和特征向量
+    vec3 lambda;
+    mat3 R;
+    eigenDecompositionSymmetric(covMatrix, lambda, R);
+
+    // ===== 标准各向异性核 (Yu & Turk, 2013) =====
+    // 使用 uniform 参数，支持运行时调整
+    const float baseRadius = fluidParticleRadius * anisotropicBaseRadiusScale;
+    const float ani_ratio_max = anisotropicMaxRatio;        // 最大各向异性比：主轴/短轴
+    const float abs_min = anisotropicMinScale;              // 绝对下界系数（相对h）
+    const float abs_max = anisotropicMaxScale;              // 绝对上界系数（相对h）
+    const float n_e = anisotropicNeighborThreshold;         // 各向异性阈值 (邻居数)
+    
+    // 1. 归一化特征值到主轴 (lambda已降序排列)，并限制各向异性比
+    vec3 normalizedLambda = lambda / max(lambda.x, 1e-6);
+    float minNorm = 1.0 / (ani_ratio_max * ani_ratio_max);
+    normalizedLambda = clamp(normalizedLambda, vec3(minNorm), vec3(1.0));
+    
+    // 2. 主轴半径：r_i = h_vis * sqrt(λ_i / λ_max)
+    vec3 sigma = baseRadius * sqrt(normalizedLambda);
+    
+    // 3. 绝对半径限制，避免异常半径
+    sigma = clamp(sigma, vec3(abs_min * baseRadius), vec3(abs_max * baseRadius));
+    
+    // 4. 邻居不足时平滑到各向同性（半径=baseRadius）
+    if (ngbr_cnt < uint(n_e)) {
+        float alpha = float(ngbr_cnt) / n_e;
+        sigma = mix(vec3(baseRadius), sigma, alpha);
+    }
+    
+    // 构建对角协方差矩阵 Σ^2
+    mat3 Sigma2 = mat3(
+        sigma.x * sigma.x, 0.0, 0.0,      // 第0列: [σ_x², 0, 0]
+        0.0, sigma.y * sigma.y, 0.0,      // 第1列: [0, σ_y², 0]
+        0.0, 0.0, sigma.z * sigma.z       // 第2列: [0, 0, σ_z²]
+    );
+    
+    // 重建最终协方差矩阵：G = R * Σ² * R^T
+    // 这是标准的各向异性核变换
+    mat3 finalCovMatrix = R * Sigma2 * transpose(R);
+    
+    // 验证矩阵有效性
+    bool isValid = true;
+    if (any(isnan(finalCovMatrix[0])) || any(isnan(finalCovMatrix[1])) || any(isnan(finalCovMatrix[2])) ||
+        any(isinf(finalCovMatrix[0])) || any(isinf(finalCovMatrix[1])) || any(isinf(finalCovMatrix[2]))) {
+        isValid = false;
+    }
+    
+    // 如果矩阵无效，使用默认球体
+    if (!isValid) {
+        float r2 = fluidParticleRadius * fluidParticleRadius;
+        finalCovMatrix = mat3(
+            r2, 0.0, 0.0,      // 第0列
+            0.0, r2, 0.0,      // 第1列
+            0.0, 0.0, r2       // 第2列
+        );
+    }
+    
+    // 存储结果（列主序）
+    // 这里正确地将列向量存储到输出缓冲区
+    anisotrophicMatrices[globalindex].aniMtCol0 = finalCovMatrix[0];
+    anisotrophicMatrices[globalindex].aniMtCol1 = finalCovMatrix[1];
+    anisotrophicMatrices[globalindex].aniMtCol2 = finalCovMatrix[2];
+}

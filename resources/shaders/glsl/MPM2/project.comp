@@ -1,0 +1,62 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#include "mpm2common.h"
+#include "mg_common.h"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 4) buffer PressureA { float pA[]; };
+layout(std430, set = 0, binding = 5) buffer PressureB { float pB[]; };
+
+float readP(uint idx) {
+    return (mg.src == 0) ? pA[idx] : pB[idx];
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    int n = mg.n;
+    uint count = uint(n * n * n);
+    if (tid >= count) return;
+
+    int x = int(tid) / (n * n);
+    int y = (int(tid) / n) % n;
+    int z = int(tid) % n;
+
+    int idxC = x * n * n + y * n + z;
+    if (cells[idxC].mass <= 0 || decodeFixedPoint(cells[idxC].mass) <= 1e-6) return;
+
+    if (x <= 0 || y <= 0 || z <= 0 || x >= n - 1 || y >= n - 1 || z >= n - 1) {
+        cells[idxC].vx = 0;
+        cells[idxC].vy = 0;
+        cells[idxC].vz = 0;
+        return;
+    }
+
+    uint base = uint(mg.levelOffset);
+
+    int idxL = (x - 1) * n * n + y * n + z;
+    int idxR = (x + 1) * n * n + y * n + z;
+    int idxD = x * n * n + (y - 1) * n + z;
+    int idxU = x * n * n + (y + 1) * n + z;
+    int idxB = x * n * n + y * n + (z - 1);
+    int idxF = x * n * n + y * n + (z + 1);
+
+    float pL = (cells[idxL].mass > 0 && decodeFixedPoint(cells[idxL].mass) > 1e-6) ? readP(base + uint(idxL)) : 0.0;
+    float pR = (cells[idxR].mass > 0 && decodeFixedPoint(cells[idxR].mass) > 1e-6) ? readP(base + uint(idxR)) : 0.0;
+    float pD = (cells[idxD].mass > 0 && decodeFixedPoint(cells[idxD].mass) > 1e-6) ? readP(base + uint(idxD)) : 0.0;
+    float pU = (cells[idxU].mass > 0 && decodeFixedPoint(cells[idxU].mass) > 1e-6) ? readP(base + uint(idxU)) : 0.0;
+    float pB = (cells[idxB].mass > 0 && decodeFixedPoint(cells[idxB].mass) > 1e-6) ? readP(base + uint(idxB)) : 0.0;
+    float pF = (cells[idxF].mass > 0 && decodeFixedPoint(cells[idxF].mass) > 1e-6) ? readP(base + uint(idxF)) : 0.0;
+
+    vec3 grad = 0.5 * vec3(pR - pL, pU - pD, pF - pB);
+
+    vec3 v = vec3(decodeFixedPoint(cells[idxC].vx), decodeFixedPoint(cells[idxC].vy), decodeFixedPoint(cells[idxC].vz));
+    v -= dt * grad;
+
+    float v_allowed = (dt > 0.0) ? (0.9 / dt) : 0.0;
+    v = clamp(v, vec3(-v_allowed), vec3(v_allowed));
+
+    cells[idxC].vx = encodeFixedPoint(v.x);
+    cells[idxC].vy = encodeFixedPoint(v.y);
+    cells[idxC].vz = encodeFixedPoint(v.z);
+}

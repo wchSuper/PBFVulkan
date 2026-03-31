@@ -1,0 +1,42 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+
+#include "simulationcommon.h"
+
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+
+void main()
+{
+    // 只计算maxParticles外的cube particle
+    uint globalindex = gl_GlobalInvocationID.x + maxParticles;
+    if (globalindex >= gl_GlobalInvocationID.x + maxParticles + cubeParticleNum) return;
+
+    vec3 pos = cubeParticles[globalindex - maxParticles].Location.xyz;
+    // vec3 boundary = vec3(-0.2, -0.2, -0.2);
+    vec3 boundary = boundary_min;
+    vec3 normalized_idx = ((pos - boundary) / (0.01 * 2));
+    uint cellindex = FlatCell(normalized_idx);
+
+    uint num_ngbrs = 0, start_ngbr = 0;
+
+    float mass0 = 1.5;
+    float mW = 0;
+    
+    for (uint i = 0; i < 27; ++i)
+    {
+        vec3 ngbr_cell_idx = normalized_idx + cell_offset[i];
+        if (ngbr_cell_idx.x < 0 || ngbr_cell_idx.y < 0 || ngbr_cell_idx.z < 0) continue;
+        uint flatted_cell_idx = FlatCell(ngbr_cell_idx);
+        num_ngbrs = neighborCpyCount[flatted_cell_idx] + cellOffset[flatted_cell_idx - 1];
+        start_ngbr = cellOffset[flatted_cell_idx - 1];
+
+        for (uint ngbr = start_ngbr; ngbr < num_ngbrs; ++ngbr)
+        {
+            uint mapped_ngbr = testPBF[ngbr];
+            if (mapped_ngbr == globalindex || mapped_ngbr < maxParticles) continue;
+            mW += mass0 * W_Poly6(pos - cubeParticles[mapped_ngbr - maxParticles].Location, sphRadius);
+        }
+    }
+
+    cubeParticles[globalindex - maxParticles].Mass = restDensity * mass0 / mW;
+}

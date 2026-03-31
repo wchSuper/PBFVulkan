@@ -1,0 +1,15 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+
+#include "simulationcommon.h"
+
+
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+
+
+void main() {
+   uint particleindex = gl_GlobalInvocationID.x;
+   if(particleindex >= numParticles) return;
+
+   particlesOut[particleindex].TmpVelocity = particlesOut[particleindex].Velocity;
+}

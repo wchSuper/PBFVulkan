@@ -1,0 +1,204 @@
+#version 450
+
+struct ClothPoint {
+    vec4 pos;
+    vec4 vel;
+    vec4 uv;
+    vec4 normal;
+    vec4 deltaPos;
+};
+
+layout (binding = 1) uniform UniformSimBuffer 
+{
+	float deltaT;
+	float particleMass;
+	float springStiffness;
+	float damping;
+
+	// mass-spring system (force)
+	float restDistH;
+	float restDistV;
+	float restDistD;
+	float sphereRadius;
+	
+	// pbd (position)
+	uint usePBD;
+	float restDistStretch;
+	float restDistShear;
+	float restDistBend;
+
+	vec4 spherePos;
+	vec4 gravity;
+	ivec2 particleCount;
+} params;
+
+layout (binding = 2) buffer ParticleIn {
+	ClothPoint particleIn[];
+};
+
+layout (binding = 3) buffer ParticleOut {
+	ClothPoint particleOut[];
+};
+
+layout (local_size_x = 10, local_size_y = 10) in;
+
+// 约束函数: C(x_i, x_j) = ||x_i - x_j|| - L0
+// 梯度: n = (x_i - x_j)/||x_i - x_j|| 求导: ∂C/∂x_i = n, ∂C/∂x_j = -n
+// PBD 位置修正:
+// 令 w = w_i + w_j 若 w = 0 则跳过
+// Δx_i = -(w_i/w) C n   Δx_j = +(w_j/w) C n
+vec3 solveDistance(vec3 xi, float wi, vec3 xj, float wj, float restLen)
+{
+    vec3 d = xi - xj;
+    float L = length(d);
+    if (L < 1e-6) return vec3(0.0);
+    float C = L - restLen;
+    float wsum = wi + wj;
+    if (wsum <= 0.0) return vec3(0.0);
+    vec3 n = d / L;
+
+    vec3 corr_i = -(wi / wsum) * C * n;
+    return corr_i;
+}
+
+vec3 StretchConstraint(int ix, int iy, int W, int H, vec3 pos, float invM) {
+    vec3 totalDeltaPos = vec3(0.0);
+    if (ix + 1 < W) {
+        uint j = uint(iy * W + (ix + 1));
+        vec3 xj = particleOut[j].pos.xyz, xi = pos;
+        totalDeltaPos += solveDistance(xi, invM, xj, invM, params.restDistStretch);
+    }
+    if (iy + 1 < H) {
+        uint j = uint((iy + 1) * W + ix);
+        vec3 xj = particleOut[j].pos.xyz, xi = pos;
+        totalDeltaPos += solveDistance(xi, invM, xj, invM, params.restDistStretch);
+    }
+    if (ix - 1 >= 0) {
+        uint j = uint(iy * W + (ix - 1));
+        vec3 xj = particleOut[j].pos.xyz, xi = pos;
+        totalDeltaPos += solveDistance(xi, invM, xj, invM, params.restDistStretch);
+    }
+    if (iy - 1 >= 0) {
+        uint j = uint((iy - 1) * W + ix);
+        vec3 xj = particleOut[j].pos.xyz, xi = pos;
+        totalDeltaPos += solveDistance(xi, invM, xj, invM, params.restDistStretch);
+    }
+    return totalDeltaPos;
+}
+
+vec3 ShearConstraint(int ix, int iy, int W, int H, vec3 pos, float invM) {
+    vec3 totalDeltaPos = vec3(0.0);
+    if (ix + 1 < W && iy + 1 < H) {
+        uint j = uint((iy + 1) * W + (ix + 1));
+        vec3 xj = particleOut[j].pos.xyz, xi = pos;
+        totalDeltaPos += solveDistance(xi, invM, xj, invM, params.restDistShear);
+    }
+    if (ix - 1 >= 0 && iy + 1 < H) {
+		uint j = uint((iy + 1) * W + (ix - 1));
+		vec3 xj = particleOut[j].pos.xyz, xi = pos;
+		totalDeltaPos += solveDistance(xi, invM, xj, invM, params.restDistShear);
+	}
+    if (ix - 1 >= 0 && iy - 1 >= 0) {
+        uint j = uint((iy - 1) * W + (ix - 1));
+ 		vec3 xj = particleOut[j].pos.xyz, xi = pos;
+		totalDeltaPos += solveDistance(xi, invM, xj, invM, params.restDistShear);
+    }
+    if (ix + 1 < W && iy - 1 >= 0) {
+        uint j = uint((iy - 1) * W + (ix + 1));
+        vec3 xj = particleOut[j].pos.xyz, xi = pos;
+		totalDeltaPos += solveDistance(xi, invM, xj, invM, params.restDistShear);
+    }
+    return totalDeltaPos;
+}
+
+vec3 BendConstraint(int ix, int iy, int W, int H, vec3 pos, float invM) {
+    vec3 totalDeltaPos = vec3(0.0);
+    if (ix + 2 < W) {
+		uint j = uint(iy * W + (ix + 2));
+        vec3 xj = particleOut[j].pos.xyz, xi = pos;
+        totalDeltaPos += solveDistance(xi, invM, xj, invM, params.restDistBend);
+    }
+    if (iy + 2 < H) {
+        uint j = uint((iy + 2) * W + ix);
+		vec3 xj = particleOut[j].pos.xyz, xi = pos;
+        totalDeltaPos += solveDistance(xi, invM, xj, invM, params.restDistBend);
+    }
+    if (ix - 2 >= 0) {
+        uint j = uint(iy * W + (ix - 2));
+        vec3 xj = particleOut[j].pos.xyz, xi = pos;
+        totalDeltaPos += solveDistance(xi, invM, xj, invM, params.restDistBend);
+    }
+    if (iy - 2 >= 0) {
+        uint j = uint((iy - 2) * W + ix);
+        vec3 xj = particleOut[j].pos.xyz, xi = pos;
+        totalDeltaPos += solveDistance(xi, invM, xj, invM, params.restDistBend);
+    }
+    return totalDeltaPos;
+}
+
+void main()
+{
+    uvec3 id = gl_GlobalInvocationID;
+    if (id.x >= uint(params.particleCount.x) || id.y >= uint(params.particleCount.y)) {
+        return;
+    }
+    uint index = id.y * uint(params.particleCount.x) + id.x;
+    if (index >= uint(params.particleCount.x) * uint(params.particleCount.y)) {
+       return; 
+    }
+
+    float invM = 1.0 / params.particleMass;
+    vec3 pos = particleOut[index].pos.xyz;
+    vec3 vel = particleOut[index].vel.xyz;
+    vec3 g = params.gravity.xyz;
+    float dt = params.deltaT;
+    
+    // constraint
+    int W = int(params.particleCount.x), H = int(params.particleCount.y);
+    int ix = int(id.x), iy = int(id.y);
+    vec3 totalDeltaPos = vec3(0.0);
+    vec3 targetPos = pos;
+
+    // 1. stretch : up / down / left / right
+    totalDeltaPos += StretchConstraint(ix, iy, W, H, pos, invM);
+
+    // 2. shear : leftUp / leftDown / rightUp / rightDown 
+    totalDeltaPos += ShearConstraint(ix, iy, W, H, pos, invM);
+
+    // 3. Bend : upup / downdown / leftleft / rightright
+    // totalDeltaPos += BendConstraint(ix, iy, W, H, pos, invM);
+
+    // sphere collision
+    vec3 sphereDist = targetPos - params.spherePos.xyz;
+    float sLen = length(sphereDist);
+    float epsilon = 0.01;
+    bool collided = sLen < params.sphereRadius + epsilon;
+    vec3 n = vec3(0.0);
+    if (collided) {
+        if (sLen < 1e-6) {
+            n = vec3(0.0, 1.0, 0.0); // push upwards if at center
+        } else {
+            n = sphereDist / sLen;
+        }
+        targetPos = params.spherePos.xyz + n * (params.sphereRadius + epsilon);
+    }
+
+    // vec3 old_pos = pos;
+    vec3 old_pos = particleIn[index].pos.xyz;
+    vec3 vNew = (targetPos - old_pos) / dt;
+
+    if (collided) {
+        vec3 tangentialVel = vNew - dot(vNew, n) * n;
+        vNew += tangentialVel * 0.8;
+    }
+
+    float dampPost = clamp(params.damping, 0.0, 0.99);
+    vNew *= (1.0 - dampPost);
+    float maxVel = 10.0;
+    if (length(vNew) > maxVel) vNew = normalize(vNew) * maxVel;
+
+    particleOut[index].vel = vec4(vNew, 0.0);
+    particleOut[index].uv  = particleIn[index].uv;
+    particleOut[index].normal = particleIn[index].normal;
+    particleOut[index].deltaPos = vec4(targetPos - pos, 1.0);
+}

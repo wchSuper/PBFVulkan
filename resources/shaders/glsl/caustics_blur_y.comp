@@ -1,0 +1,46 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#include "renderingcommon.h"
+
+layout(local_size_x=4, local_size_y=4, local_size_z=1) in;
+
+layout(binding=1) uniform sampler2D depthimage;
+layout(binding=2) uniform sampler2D thicknessimage;
+layout(binding=3) uniform sampler2D boxdepthimage;
+layout(binding=4) uniform sampler2D causticsinput;
+layout(binding=5, r32f) uniform writeonly image2D causticsout;
+
+float gaussian(float x, float sigma) {
+    return exp(-(x * x) / (2.0 * sigma * sigma));
+}
+
+void main() {
+    ivec2 outcoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imagesize = imageSize(causticsout);
+    if (outcoord.x >= imagesize.x || outcoord.y >= imagesize.y) return;
+
+    if (causticsIntensity <= 0.0) {
+        imageStore(causticsout, outcoord, vec4(0.0));
+        return;
+    }
+
+    vec2 uv = (vec2(outcoord) + vec2(0.5)) / vec2(imagesize);
+
+    float r_f = clamp(causticsPhotonRadius * 2.0, 1.0, 25.0);
+    int r = int(r_f);
+    float sigma = max(r_f * 0.5, 1.0);
+
+    float wsum = 0.0;
+    float sum = 0.0;
+
+    for (int dy = -r; dy <= r; ++dy) {
+        vec2 uv_d = uv + vec2(0.0, float(dy) / float(imagesize.y));
+        float v = texture(causticsinput, uv_d).r;
+        float w = gaussian(float(dy), sigma);
+        wsum += w;
+        sum += v * w;
+    }
+
+    float outv = (wsum > 0.0) ? (sum / wsum) : 0.0;
+    imageStore(causticsout, outcoord, vec4(outv, 0.0, 0.0, 0.0));
+}

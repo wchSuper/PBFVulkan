@@ -1,0 +1,60 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#include "mpm2common.h"
+#include "mg_common.h"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 4) buffer PressureA { float pA[]; };
+layout(std430, set = 0, binding = 5) buffer PressureB { float pB[]; };
+layout(std430, set = 0, binding = 6) buffer RHS { float rhs[]; };
+
+float readP(uint idx) {
+    return (mg.src == 0) ? pA[idx] : pB[idx];
+}
+
+void writeP(uint idx, float v) {
+    if (mg.src == 0) {
+        pB[idx] = v;
+    } else {
+        pA[idx] = v;
+    }
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    int n = mg.n;
+    uint count = uint(n * n * n);
+    if (tid >= count) return;
+
+    int x = int(tid) / (n * n);
+    int y = (int(tid) / n) % n;
+    int z = int(tid) % n;
+
+    uint base = uint(mg.levelOffset);
+    uint idx = base + tid;
+
+    if (x <= 0 || y <= 0 || z <= 0 || x >= n - 1 || y >= n - 1 || z >= n - 1) {
+        writeP(idx, 0.0);
+        return;
+    }
+
+    int idxL = (x - 1) * n * n + y * n + z;
+    int idxR = (x + 1) * n * n + y * n + z;
+    int idxD = x * n * n + (y - 1) * n + z;
+    int idxU = x * n * n + (y + 1) * n + z;
+    int idxB = x * n * n + y * n + (z - 1);
+    int idxF = x * n * n + y * n + (z + 1);
+
+    float pSum =
+        readP(base + uint(idxL)) +
+        readP(base + uint(idxR)) +
+        readP(base + uint(idxD)) +
+        readP(base + uint(idxU)) +
+        readP(base + uint(idxB)) +
+        readP(base + uint(idxF));
+
+    float b = rhs[idx];
+    float newP = (b + pSum) / 6.0;
+    writeP(idx, newP);
+}

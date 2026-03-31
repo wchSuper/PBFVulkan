@@ -1,0 +1,146 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#extension GL_EXT_shader_atomic_float : enable
+#include "simulationcommon.h"
+
+layout(binding=20) buffer DiffuseParticleCountBuffer {
+    DiffuseParticleCount dpc;
+};
+
+layout(binding=21) buffer SurfaceParticleBuffer {
+    uint surfaceParticles[];  
+};
+
+layout(binding=19) buffer DiffuseParticleBuffer {
+    DiffuseParticle diffuseParticles[];
+};
+
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+
+void main() {
+    uint globalindex = gl_GlobalInvocationID.x;
+    if (globalindex >= dpc.surfaceParticleCount) return;
+    
+    uint surfaceParticleIndex = surfaceParticles[globalindex];
+    if (surfaceParticleIndex == 0xFFFFFFFF || surfaceParticleIndex >= numParticles) return;
+    
+    vec3 surfacePos = particlesOut[surfaceParticleIndex].Location.xyz;
+    vec3 surfaceVel = particlesOut[surfaceParticleIndex].Velocity.xyz;
+    float velMagnitude = length(surfaceVel);
+    
+    // ================ 借鉴FleX：计算速度散度 =================
+    // 散度 = ∇·v，反映流体的压缩/膨胀
+    vec3 boundary = boundary_min;
+    vec3 normalized_idx = ((surfacePos - boundary) / (0.01 * 2));
+    float divergence = 0.0;
+    uint neighborCount = 0;
+    
+    for (uint i = 0; i < 27; ++i) {
+        vec3 ngbr_cell_idx = normalized_idx + cell_offset[i];
+        if (ngbr_cell_idx.x < 0 || ngbr_cell_idx.y < 0 || ngbr_cell_idx.z < 0) continue;
+        uint flatted_cell_idx = FlatCell(ngbr_cell_idx);
+        uint num_ngbrs = neighborCpyCount[flatted_cell_idx] + cellOffset[flatted_cell_idx - 1];
+        uint start_ngbr = cellOffset[flatted_cell_idx - 1];
+        
+        for (uint ngbr = start_ngbr; ngbr < num_ngbrs && neighborCount < 30; ++ngbr) {
+            uint mapped_ngbr = testPBF[ngbr];
+            if (mapped_ngbr == surfaceParticleIndex || mapped_ngbr >= maxParticles) continue;
+            
+            vec3 r = surfacePos - particlesOut[mapped_ngbr].Location;
+            float dist = length(r);
+            
+            if (dist < sphRadius && dist > 1e-6) {
+                // 速度差
+                vec3 velDiff = particlesOut[mapped_ngbr].Velocity - surfaceVel;
+                
+                // SPH Spiky核函数的梯度：∇W = -45/(π*h^6) * (h-r)^2 * r_normalized
+                float h = sphRadius;
+                float factor = -45.0 / (3.14159265 * pow(h, 6.0)) * pow(h - dist, 2.0);
+                vec3 gradW = factor * (r / dist);
+                
+                // 累加散度：div = Σ (v_j - v_i) · ∇W
+                divergence += dot(velDiff, gradW);
+                neighborCount++;
+            }
+        }
+    }
+    
+    // 归一化散度
+    if (neighborCount > 0) {
+        divergence /= float(neighborCount);
+    }
+    
+    // FleX参数
+    const float divergenceThreshold = 0.05;  // 散度阈值
+    float absDivergence = abs(divergence);
+    
+    // 生成概率：散度越大，生成越多
+    uint seed_base = surfaceParticleIndex + uint(accumulated_t * 1000.0);
+    float spawnProbability = clamp(absDivergence * 10.0, 0.0, 0.9);
+    float randSpawn = random_float(seed_base);
+    
+    if (randSpawn > spawnProbability) return;
+    
+    // 生成数量：散度大时生成更多
+    uint foamCount = (absDivergence > 0.1) ? 2u : 1u;
+    
+    // ========== FleX风格：简单的原子追加 ==========
+    for (uint i = 0; i < foamCount; i++) {
+        // 原子追加到数组末尾
+        uint foamIndex = atomicAdd(dpc.activeCount, 1);
+        
+        if (foamIndex >= maxDiffuseParticles) {
+            atomicAdd(dpc.activeCount, -1);  // 把已经加上的activeCount退回来
+            break;  
+        }
+        
+        uint seed = seed_base * 1000u + i * 173u;
+        float randX = random_float(seed) * 2.0 - 1.0;
+        float randY = random_float(seed + 1u) * 2.0 - 1.0;
+        float randZ = random_float(seed + 2u) * 2.0 - 1.0;
+        vec3 randDir = normalize(vec3(randX, randY, randZ));
+        
+        // ========== FleX方法：根据散度判断粒子类型 ==========
+        uint particleType;
+        
+        if (divergence < -divergenceThreshold) {
+            // 散度 < 0：流体压缩 → Spray (飞溅)
+            particleType = 1;
+        } else if (divergence > divergenceThreshold) {
+            // 散度 > 0：流体膨胀 → Bubble (气泡)
+            particleType = 2;
+        } else {
+            // 散度 ≈ 0：平稳流动 → Foam (泡沫)
+            particleType = 1;
+        }
+        
+        // 位置偏移：spray向速度方向，bubble向上，foam随机
+        vec3 offset;
+        vec3 foamVel;
+        float lifeTime;
+        
+        if (particleType == 1) {
+            // Spray/Foam: 沿速度方向发射
+            vec3 velDir = (velMagnitude > 0.1) ? normalize(surfaceVel) : vec3(0, 1, 0);
+            offset = (velDir + randDir * 0.3) * fluidParticleRadius * 2.0;
+            foamVel = surfaceVel * (0.9 + random_float(seed + 4u) * 0.2);
+            foamVel += randDir * velMagnitude * 0.1;
+            lifeTime = 1.0 + random_float(seed + 3u) * 1.5;
+        } else {
+            // Bubble: 在水下生成，向上漂浮
+            offset = vec3(0, -fluidParticleRadius * 0.5, 0) + randDir * fluidParticleRadius * 0.5;
+            foamVel = surfaceVel * 0.3 + vec3(0, 0.5, 0);
+            lifeTime = 2.0 + random_float(seed + 3u) * 2.0;
+        }
+        
+        vec3 foamPos = surfacePos + offset;
+        
+        // 写入粒子数据
+        diffuseParticles[foamIndex].Location = foamPos;
+        diffuseParticles[foamIndex].Velocity = foamVel;
+        diffuseParticles[foamIndex].LifeTime = lifeTime;
+        diffuseParticles[foamIndex].Type = particleType;
+        diffuseParticles[foamIndex].Mass = (particleType == 2) ? 0.3 : 0.5; // bubble更轻
+        diffuseParticles[foamIndex].DiffuseBuoyancy = (particleType == 2) ? 8.0 : 3.0;
+    }
+}

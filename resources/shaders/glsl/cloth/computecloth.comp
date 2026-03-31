@@ -1,0 +1,168 @@
+#version 450
+
+struct ClothPoint {
+    vec4 pos;
+    vec4 vel;
+    vec4 uv;
+    vec4 normal;
+	vec4 deltaPos;
+};
+
+layout (binding = 1) uniform UniformSimBuffer 
+{
+	float deltaT;
+	float particleMass;
+	float springStiffness;
+	float damping;
+
+	// mass-spring system (force)
+	float restDistH;
+	float restDistV;
+	float restDistD;
+	float sphereRadius;
+	
+	// pbd 
+	bool usePBD;
+	float restDistStretch;
+	float restDistShear;
+	float restDistBend;
+
+	vec4 spherePos;
+	vec4 gravity;
+	ivec2 particleCount;
+} params;
+
+layout (binding = 2) buffer ParticleIn {
+	ClothPoint particleIn[];
+};
+
+layout (binding = 3) buffer ParticleOut {
+	ClothPoint particleOut[];
+};
+
+vec3 springForce(vec3 p0, vec3 p1, float restDist) 
+{
+	vec3 dist = p0 - p1;
+	float distLength = length(dist);
+	if (distLength < 0.0001) return vec3(0.0); // 防止零长度时的数值不稳定
+	return normalize(dist) * params.springStiffness * (distLength - restDist);
+}
+
+layout (local_size_x = 10, local_size_y = 10) in;
+void main()
+{
+    uvec3 id = gl_GlobalInvocationID;
+    uint index = id.y * params.particleCount.x + id.x;
+    if (index >= params.particleCount.x * params.particleCount.y) {
+       return; 
+    }
+
+    // force from gravity
+    vec3 force = params.gravity.xyz * params.particleMass;
+    vec3 pos = particleIn[index].pos.xyz;
+    vec3 vel = particleIn[index].vel.xyz;
+
+    // spring forces from neighboring particles
+	// left
+	if (id.x > 0) {
+		force += springForce(particleIn[index - 1].pos.xyz, pos, params.restDistH);
+	} 
+	// right
+	if (id.x < params.particleCount.x - 1) {
+		force += springForce(particleIn[index + 1].pos.xyz, pos, params.restDistH);
+	}
+	// upper
+	if (id.y < params.particleCount.y - 1) {
+		force += springForce(particleIn[index + params.particleCount.x].pos.xyz, pos, params.restDistV);
+	} 
+	// lower
+	if (id.y > 0) {
+		force += springForce(particleIn[index - params.particleCount.x].pos.xyz, pos, params.restDistV);
+	} 
+	// upper-left
+	if ((id.x > 0) && (id.y < params.particleCount.y - 1)) {
+		force += springForce(particleIn[index + params.particleCount.x - 1].pos.xyz, pos, params.restDistD);
+	}
+	// lower-left
+	if ((id.x > 0) && (id.y > 0)) {
+		force += springForce(particleIn[index - params.particleCount.x - 1].pos.xyz, pos, params.restDistD);
+	}
+	// upper-right
+	if ((id.x < params.particleCount.x - 1) && (id.y < params.particleCount.y - 1)) {
+		force += springForce(particleIn[index + params.particleCount.x + 1].pos.xyz, pos, params.restDistD);
+	}
+	// lower-right
+	if ((id.x < params.particleCount.x - 1) && (id.y > 0)) {
+		force += springForce(particleIn[index - params.particleCount.x + 1].pos.xyz, pos, params.restDistD);
+	}
+    force += (-params.damping * vel);
+
+	// integrate
+	vec3 f = force * (1.0 / params.particleMass);
+	particleOut[index].vel = vec4(vel + f * params.deltaT, 0.0);
+	// particleOut[index].pos = vec4(pos + particleOut[index].vel * params.deltaT, 1.0);
+	particleOut[index].pos = vec4(pos + vel * params.deltaT + 0.5 * f * params.deltaT * params.deltaT, 1.0);
+
+    // sphere collision
+	vec3 sphereDist = particleOut[index].pos.xyz - params.spherePos.xyz;
+	if (length(sphereDist) < params.sphereRadius + 0.01) {
+		vec3 normal = normalize(sphereDist);
+		particleOut[index].pos.xyz = params.spherePos.xyz + normal * (params.sphereRadius + 0.01);
+		
+		// 保留切向速度，只清零法向速度
+		vec3 vel = particleOut[index].vel.xyz;
+		vec3 tangentialVel = vel - dot(vel, normal) * normal;
+		particleOut[index].vel = vec4(tangentialVel * 0.8, 0.0); // 添加一些能量损失
+	}
+
+	// compute normal
+	{
+		vec3 normal = vec3(0.0);
+		int validTriangles = 0;
+		
+		// 计算周围三角形的法线并平均
+		// 右下三角形
+		if (id.x < params.particleCount.x - 1 && id.y < params.particleCount.y - 1) {
+			vec3 p1 = particleIn[index + 1].pos.xyz - particleIn[index].pos.xyz;
+			vec3 p2 = particleIn[index + params.particleCount.x].pos.xyz - particleIn[index].pos.xyz;
+			vec3 triNormal = normalize(cross(p1, p2));
+			normal += triNormal;
+			validTriangles++;
+		}
+		
+		// 左下三角形
+		if (id.x > 0 && id.y < params.particleCount.y - 1) {
+			vec3 p1 = particleIn[index - 1].pos.xyz - particleIn[index].pos.xyz;
+			vec3 p2 = particleIn[index + params.particleCount.x].pos.xyz - particleIn[index].pos.xyz;
+			vec3 triNormal = normalize(cross(p2, p1));
+			normal += triNormal;
+			validTriangles++;
+		}
+		
+		// 右上三角形
+		if (id.x < params.particleCount.x - 1 && id.y > 0) {
+			vec3 p1 = particleIn[index + 1].pos.xyz - particleIn[index].pos.xyz;
+			vec3 p2 = particleIn[index - params.particleCount.x].pos.xyz - particleIn[index].pos.xyz;
+			vec3 triNormal = normalize(cross(p2, p1));
+			normal += triNormal;
+			validTriangles++;
+		}
+		
+		// 左上三角形
+		if (id.x > 0 && id.y > 0) {
+			vec3 p1 = particleIn[index - 1].pos.xyz - particleIn[index].pos.xyz;
+			vec3 p2 = particleIn[index - params.particleCount.x].pos.xyz - particleIn[index].pos.xyz;
+			vec3 triNormal = normalize(cross(p1, p2));
+			normal += triNormal;
+			validTriangles++;
+		}
+		
+		if (validTriangles > 0) {
+			normal = normalize(normal / float(validTriangles));
+		} else {
+			normal = vec3(0.0, 1.0, 0.0);
+		}
+		
+		particleOut[index].normal = vec4(normal, 0.0);
+	}
+}

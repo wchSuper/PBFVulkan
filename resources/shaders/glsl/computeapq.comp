@@ -1,0 +1,39 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#extension GL_EXT_shader_atomic_float : enable
+#include "simulationcommon.h"
+
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+
+void main()
+{
+    uint base_num = maxParticles + maxCubeParticles;
+    uint max_num = base_num + rigidParticles;
+    uint globalindex = gl_GlobalInvocationID.x;
+    if (globalindex >= base_num && globalindex < max_num) {
+        vec3 ri = rigidParticlesInfo[globalindex - base_num].Location.xyz - smi.CM;
+        vec3 r0 = originRigidParticlesInfo[globalindex - base_num].Location.xyz - smi.CM0;
+
+        // 手动计算 ri⊗r0^T
+        vec3 contrib_col0 = vec3(ri.x * r0.x, ri.y * r0.x, ri.z * r0.x);
+        vec3 contrib_col1 = vec3(ri.x * r0.y, ri.y * r0.y, ri.z * r0.y);
+        vec3 contrib_col2 = vec3(ri.x * r0.z, ri.y * r0.z, ri.z * r0.z);
+
+        atomicAdd(smi.Apq_col0.x, contrib_col0.x);
+        atomicAdd(smi.Apq_col0.y, contrib_col0.y);
+        atomicAdd(smi.Apq_col0.z, contrib_col0.z);
+        
+        atomicAdd(smi.Apq_col1.x, contrib_col1.x);
+        atomicAdd(smi.Apq_col1.y, contrib_col1.y);
+        atomicAdd(smi.Apq_col1.z, contrib_col1.z);
+        
+        atomicAdd(smi.Apq_col2.x, contrib_col2.x);
+        atomicAdd(smi.Apq_col2.y, contrib_col2.y);
+        atomicAdd(smi.Apq_col2.z, contrib_col2.z);
+
+        // 存在数据竞争
+        // smi.Apq_col0 += contrib_col0;
+        // smi.Apq_col1 += contrib_col1;
+        // smi.Apq_col2 += contrib_col2;
+    }
+}

@@ -1,0 +1,72 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+
+#include "simulationcommon.h"
+
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+
+void main() {
+    // 只对 rigid particles部分进行约束
+    uint base_num = maxParticles + maxCubeParticles;
+    uint max_num = base_num + rigidParticles;
+    uint globalindex = gl_GlobalInvocationID.x;
+    if (globalindex >= base_num && globalindex < max_num) {
+        vec3 LocationStar = rigidParticlesInfo[globalindex - base_num].Location + rigidParticlesInfo[globalindex - base_num].DeltaLocation;
+        vec3 DeltaLocation = rigidParticlesInfo[globalindex - base_num].DeltaLocation;
+        float distLeft = LocationStar.x - boxClampX.x;
+        float distRight = boxClampX.y - LocationStar.x;
+
+        float distFront = boxClampZ.y- LocationStar.z;
+        float distBack = LocationStar.z - boxClampZ.x;
+        
+        float distFloor = LocationStar.y - boxClampY.x;
+        float distCeil = boxClampY.y - LocationStar.y;
+
+        float dists[6] = {distLeft,distRight,distFront,distBack,distFloor,distCeil};
+        vec3 normals[6] = { {1, 0, 0}, {-1, 0, 0}, {0, 0, -1}, {0, 0, 1}, {0, 1, 0}, {0, -1, 0} };
+        float walldist = distLeft;
+        vec3 wallnormal = {1, 0, 0};
+        for(int i=1;i<6;++i){
+            if(dists[i] < walldist){
+                walldist = dists[i];
+                wallnormal = normals[i]; 
+            }
+        }
+        float rigid_radius = rigidParticleRadius;
+        if(walldist < rigid_radius){
+            DeltaLocation += (rigid_radius-walldist)*wallnormal;
+        }
+        rigidParticlesInfo[globalindex - base_num].Location += DeltaLocation;
+    }
+    else {
+        return;
+    }
+
+    // -------------------------SDF (Signed Distance Field)---------------------------------- //
+    if (isSDF) {
+        // 先看刚体粒子是否在体素区域内
+        float rigid_radius = rigidParticleRadius;
+        vec3 sdfRangeMax = sdfRangeMin + voxelResolution * voxelSize;
+        vec3 pos = rigidParticlesInfo[globalindex].Location.xyz;
+        if (pos.x < sdfRangeMin.x || pos.y < sdfRangeMin.y || pos.z < sdfRangeMin.z) return;
+        if (pos.x > sdfRangeMax.x || pos.y > sdfRangeMax.y || pos.z > sdfRangeMax.z) return;
+
+        // 获取刚体粒子在体素区域的体素坐标
+        uint vx = uint((pos.x - sdfRangeMin.x) / voxelSize);
+        uint vy = uint((pos.y - sdfRangeMin.y) / voxelSize);
+        uint vz = uint((pos.z - sdfRangeMin.z) / voxelSize);
+
+        float sdfValue = SampleSDF(voxelResolution, vx, vy, vz);
+        if (sdfValue < rigid_radius) {
+            // sdf梯度计算
+            vec3 normal = SampleSDFGrad(voxelResolution, vx, vy, vz);
+            // normal = normalize(normal); 注意 : 使用自带的normalize有可能发生除0 {normal=vec3(0)时}导致NAN
+            normal = SafeNormalize(normal);
+
+            // 推开粒子
+            float penetration = rigid_radius - sdfValue;
+            vec3 correction = penetration * normal;
+            rigidParticlesInfo[globalindex].Location.xyz += correction;
+        }
+    }
+}

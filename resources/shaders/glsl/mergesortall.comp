@@ -1,0 +1,29 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+
+#include "simulationcommon.h"
+
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+void main()
+{
+    uint globalindex = gl_GlobalInvocationID.x;
+    uint num_left = globalindex + 1;
+    uint num_true = globalindex;
+    uint rate = 1;
+    uint result = 0;
+
+    if (globalindex < gridCount)
+    {
+        while(num_left > 0)
+        {
+            if (num_left % 2 == 1)
+            {
+                result += neighborCount[num_true];
+                num_true -= rate;
+            }
+            num_left /= 2;
+            rate *= 2;
+        }
+        cellOffset[globalindex] = uint(result);
+    }
+}

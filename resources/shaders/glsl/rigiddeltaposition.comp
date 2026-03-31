@@ -1,0 +1,39 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+
+#include "simulationcommon.h"
+
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+
+void main()
+{
+    uint base_num = maxParticles + maxCubeParticles;
+    uint max_num = base_num + rigidParticles;
+    uint globalindex = gl_GlobalInvocationID.x;
+    if (globalindex >= base_num && globalindex < max_num) {
+        vec3 current_pos = rigidParticlesInfo[globalindex - base_num].Location;
+        vec3 origin_pos = originRigidParticlesInfo[globalindex - base_num].Location;
+
+        // 计算原始相对于初始质心的位置
+        vec3 r0 = origin_pos - smi.CM0;
+
+        // 构建旋转矩阵
+        mat3 R = mat3(
+            smi.Q_col0,
+            smi.Q_col1,
+            smi.Q_col2
+        );
+
+        // 计算目标位置 = 当前质心 + 旋转矩阵 * 原始相对位置
+        vec3 goal_pos = smi.CM + R * r0;
+
+        // 计算形变约束的位移  可以添加松弛因子alpha来控制约束强度
+        float alpha = 1.0;                    
+        vec3 delta = (goal_pos - current_pos) * alpha;
+        
+        // 更新粒子位置
+        // rigidParticlesInfo[globalindex - base_num].DeltaLocation = delta;
+        rigidParticlesInfo[globalindex - base_num].Location += delta;
+        
+    }
+}
